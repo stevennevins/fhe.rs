@@ -194,20 +194,52 @@ cargo run --release -p fhe --example confidential_transfer_timing               
 cargo run --release -p fhe --example confidential_transfer_timing --features cuda  # GPU
 ```
 
-A freezable (double-guard) transfer — the `ERC7984Freezable`-style
-extension — adds one more interactive comparison and one select for the
-available amount (`select(balance >= frozen, balance - frozen, 0)`) on
-top of the core transfer circuit.
-
 | Op | CPU | CUDA |
 |---|---|---|
 | committee keygen (N = 3) | 0.51 s | 0.31 s |
 | one confidential transfer | 1.14 s | 0.32 s |
-| one freezable (double-guard) transfer | 1.41 s | 0.56 s |
 
 The CUDA speedup (3.5×) comes almost entirely from the five
 relinearized multiplications inside the transfer; the committee
 round-trips (decryption shares, mask encryptions) are CPU-side and
-dominate the remaining 0.3 s. The freezable transfer's extra comparison
-is one of those CPU-side round-trips, which is why its overhead
-(~0.25 s) is similar on both backends.
+dominate the remaining 0.3 s.
+
+## ERC7984 extension suite
+
+Per-operation wall-clock cost of the `fhe::token::extensions` suite at
+the same curated parameters and 3-party committee, measured end to end
+through each extension's public entry point (averaged over 5
+iterations).
+
+Reproduce with:
+
+```bash
+cargo run --release -p fhe --example erc7984_extensions_timing                  # CPU
+cargo run --release -p fhe --example erc7984_extensions_timing --features cuda  # GPU
+```
+
+| Op | CPU | CUDA |
+|---|---|---|
+| restricted reject (public check, no encrypted work) | < 1 ms | < 1 ms |
+| restricted transfer | 1.14 s | 0.35 s |
+| identity-checked transfer | 1.14 s | 0.35 s |
+| observed transfer (ACL grants to the observer) | 1.14 s | 0.35 s |
+| freezable (double-guard) transfer | 1.39 s | 0.43 s |
+| available query (`balance − frozen`, saturating) | 0.25 s | 0.08 s |
+| wrap (public debit + confidential mint) | 0.02 s | 0.01 s |
+| unwrap (request + finalize: amount + guard decryption, refresh) | 0.38 s | 0.21 s |
+| Rwa transfer (pause/restriction checks + double guard) | 1.43 s | 0.44 s |
+| Rwa force transfer (core circuit) | 1.14 s | 0.35 s |
+| Rwa recover (encrypted min + full-balance move, two refreshes) | 0.59 s | 0.27 s |
+
+The pattern matches the core kit: operations dominated by relinearized
+multiplications (the transfer circuits) gain ~3× on CUDA, while
+operations that are mostly committee round-trips (the available query,
+unwrap, recovery) gain less — their cost is CPU-side protocol traffic.
+The public policy checks (restrictions, identity, pause, roles) cost
+effectively nothing: they reject before any encrypted work, which is
+the documented design point. Restricted / identity-checked / observed /
+force transfers run the unmodified core circuit, so their cost is the
+core transfer's; the freezable double guard adds one more interactive
+comparison and select (~0.25 s CPU, backend-independent committee
+traffic, plus ~0.1 s of GPU-side multiplications).
