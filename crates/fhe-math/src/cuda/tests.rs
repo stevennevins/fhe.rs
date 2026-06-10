@@ -9,7 +9,7 @@
 //! evaluated on a CUDA machine.)
 
 use super::{EwOp, backend, ew_force_gpu, ntt_force_gpu};
-use crate::rq::{Context, Poly, PowerBasis};
+use crate::rq::{Context, Ntt, NttShoup, Poly, PowerBasis};
 use crate::zq::primes::generate_prime;
 use rand::RngCore;
 use std::sync::Arc;
@@ -393,6 +393,62 @@ scale_tests! {
     scale_down_32768_15_8: (32768, 15, 8, false),
 }
 
+// ---------------------------------------------------------------------------
+// Fused key switching (cuda::key_switch)
+// ---------------------------------------------------------------------------
+
+/// CPU reference replicating the CPU body of `KeySwitchingKey::key_switch`
+/// in the `fhe` crate, bypassing the GPU dispatch.
+fn cpu_key_switch(
+    p: &Poly<PowerBasis>,
+    c0s: &[Poly<NttShoup>],
+    c1s: &[Poly<NttShoup>],
+    ctx_ksk: &Arc<Context>,
+) -> (Poly<Ntt>, Poly<Ntt>) {
+    let mut c0 = Poly::<Ntt>::zero(ctx_ksk);
+    let mut c1 = Poly::<Ntt>::zero(ctx_ksk);
+    let p_coefficients = p.coefficients();
+    for ((row, c0_i), c1_i) in p_coefficients.outer_iter().zip(c0s).zip(c1s) {
+        let mut c2_i = unsafe {
+            Poly::<Ntt>::create_constant_ntt_polynomial_with_lazy_coefficients_and_variable_time(
+                row.as_slice().unwrap(),
+                ctx_ksk,
+            )
+        };
+        c0 += &(&c2_i * c0_i);
+        c2_i *= c1_i;
+        c1 += &c2_i;
+    }
+    (c0, c1)
+}
+
+/// The fused GPU key switch must be bit-exact with the CPU loop it replaces,
+/// both when the input shares the ksk context and in the BFV shape where the
+/// ciphertext context is a strict prefix of the ksk context.
+#[test]
+fn key_switch_matches_cpu() {
+    require_gpu();
+    let n = 4096;
+    let ctx_ksk = test_ctx(n, 3); // n * k = 12288 >= MIN_NTT_ELEMS
+    let ctx_cipher = Arc::new(Context::new(&ctx_ksk.moduli[..2], n).unwrap());
+    let mut rng = rand::rng();
+    for ctx_p in [&ctx_ksk, &ctx_cipher] {
+        for _ in 0..5 {
+            let p = Poly::<PowerBasis>::random(ctx_p, &mut rng);
+            let c0s: Vec<_> = (0..3)
+                .map(|_| Poly::<NttShoup>::random(&ctx_ksk, &mut rng))
+                .collect();
+            let c1s: Vec<_> = (0..3)
+                .map(|_| Poly::<NttShoup>::random(&ctx_ksk, &mut rng))
+                .collect();
+            let (g0, g1) = super::key_switch(&p, &c0s, &c1s, &ctx_ksk).unwrap();
+            let (e0, e1) = cpu_key_switch(&p, &c0s, &c1s, &ctx_ksk);
+            assert_eq!(g0.coefficients(), e0.coefficients(), "c0 mismatch");
+            assert_eq!(g1.coefficients(), e1.coefficients(), "c1 mismatch");
+        }
+    }
+}
+
 /// Concurrent GPU use from many threads must be safe and bit-exact
 /// (per-thread streams + shared table caches).
 #[test]
@@ -428,7 +484,7 @@ fn small_params_stay_on_cpu() {
     require_gpu();
     // n = 2^12 with one modulus is below MIN_NTT_ELEMS.
     let ctx = test_ctx(4096, 1);
-    assert!(4096 < super::MIN_NTT_ELEMS);
+    const { assert!(4096 < super::MIN_NTT_ELEMS) };
     let original = random_coeffs(&ctx);
     let mut a = original.clone();
     assert!(!super::ntt_forward(&ctx, &mut a));
