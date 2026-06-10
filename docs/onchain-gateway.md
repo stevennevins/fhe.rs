@@ -27,6 +27,53 @@ parameter at all — a transaction can only set its **own** sender's
 observer, closing the Goal E caveat about unauthenticated
 `set_observer`.
 
+## Using the kit
+
+Two roles, two types, mirroring fhEVM's dApp-SDK / operator split:
+
+- **`fhe_coprocessor::Client`** — the user side. Encrypt-and-register
+  inputs, send entry-point transactions (each call resolves when its
+  request is fulfilled), read back what the ACL allows. A client
+  cannot reach the committee, the ciphertext store, or threshold
+  decryption — structurally, not by convention.
+- **`fhe_coprocessor::Operator`** — the operator side. One constructor
+  over the committee, `spawn()` for the live event loop,
+  `run_until_idle()`/`run_until()` for deterministic tests, and a
+  shutdown-and-handover seam (`into_state()`/`resume()`) for crash
+  recovery.
+
+The whole flow (`crates/fhe-coprocessor/examples/quickstart.rs` runs
+exactly this against a local anvil; it is also the acceptance test for
+the API's simplicity):
+
+```rust
+let operator = Operator::new(committee, agent, coprocessor_provider, gateway)?;
+let alice = operator.client(alice_provider, alice_address).await;
+let bob = operator.client(bob_provider, bob_address).await;
+let operator = operator.spawn();
+
+alice.faucet(1000).await?;          // public credit
+alice.wrap(1000).await?;            // public -> confidential
+let input = alice.encrypt_input(250).await?;   // encrypt, register, anchor
+alice.transfer(bob_address, input).await?;     // resolves on fulfillment
+let balance = alice.balance(alice_address).await?;  // ACL-checked decrypt
+```
+
+### fhEVM concept mapping
+
+| fhEVM concept | This kit |
+|---|---|
+| `createEncryptedInput(...).add64(v).encrypt()` | `client.encrypt_input(v)` — encrypts under the committee key, registers the ciphertext with the coprocessor, anchors `(handle, commitment, owner)` on-chain |
+| input handle (`input.handles[0]`) | the `B256` handle `encrypt_input` returns; spendable on-chain only by its owner |
+| input proof (`input.inputProof`) | **deliberately absent** — TODO-by-trust-model: the coprocessor validates inputs against the deployment parameters when it registers them, and v1 trusts it as executor; a ZK proof of plaintext knowledge is future work |
+| `confidentialTransfer(to, handle, proof)` | `client.transfer(to, input)` (contract entry point `confidentialTransfer(to, amountHandle)`) |
+| `confidentialBalanceOf(account)` (returns an `euint64` handle) | the contract's `confidentialBalanceOf(account)` (returns the `bytes32` handle) |
+| ACL allow (`FHE.allow(...)`) | ownership and observer grants accumulated from on-chain transactions; enforced by the coprocessor's read path |
+| user decryption (`fhevm.userDecrypt(...)`) | `client.balance(account)` / `client.frozen(account)` — threshold-decrypts through the ACL, errors cleanly when not granted |
+| decryption oracle callback | the request/fulfillment cycle: every entry point emits a request event; the operator posts one bound fulfillment transaction per request, in order |
+| symbolic execution on ciphertext handles | none — each request maps to one `fhe::token` operation executed by the coprocessor |
+| KMS / threshold network | the in-process N-of-N `fhe::gateway::Committee` (networked MPC is a named future goal) |
+
 ## Public checks stay public
 
 Role checks (agent/freezer) and public policy (pause, blocklist,
