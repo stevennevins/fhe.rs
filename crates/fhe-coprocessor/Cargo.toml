@@ -22,6 +22,7 @@ fhe-traits = { version = "=0.1.1", path = "../fhe-traits" }
 alloy.workspace = true
 futures-util.workspace = true
 rand.workspace = true
+rand_chacha.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

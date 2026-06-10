@@ -42,7 +42,10 @@
 //! and processing is idempotent per request id.
 
 pub mod abi;
+pub mod coprocessor;
 pub mod harness;
+
+pub use coprocessor::Coprocessor;
 
 /// Errors of the coprocessor service.
 #[derive(Debug, thiserror::Error)]
