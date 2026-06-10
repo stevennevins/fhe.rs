@@ -161,7 +161,7 @@ impl Service {
 /// Posts one fulfillment transaction and returns its hash. A revert is
 /// an error: it means the fulfillment did not match its request, which
 /// is a bug, not a condition to swallow.
-async fn send_fulfillment(
+pub(crate) async fn send_fulfillment(
     gateway: &IConfidentialTokenGatewayInstance<DynProvider>,
     fulfillment: &Fulfillment,
 ) -> Result<B256> {

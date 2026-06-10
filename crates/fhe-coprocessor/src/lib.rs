@@ -42,12 +42,16 @@
 //! and processing is idempotent per request id.
 
 pub mod abi;
+pub mod client;
 pub mod coprocessor;
 pub mod harness;
+pub mod operator;
 pub mod requests;
 pub mod service;
 
+pub use client::Client;
 pub use coprocessor::Coprocessor;
+pub use operator::{Operator, OperatorHandle, OperatorState};
 pub use service::Service;
 
 /// Errors of the coprocessor service.

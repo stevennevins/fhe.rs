@@ -20,7 +20,7 @@ alloy = { version = "^1.0.41", features = ["full", "node-bindings"] }
 clap = { version = "^4.5.56", features = ["derive"] }
 futures-util = "^0.3.31"
 serde_json = "^1.0.145"
-tokio = { version = "^1.48.0", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "^1.48.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
 cudarc = { version = "^0.19.7", default-features = false, features = [
     "std",
     "driver",
