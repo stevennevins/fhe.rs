@@ -3,6 +3,7 @@
 //! encrypted work" guarantee.
 
 use fhe::gateway::Committee;
+use fhe::token::extensions::freezable::Freezable;
 use fhe::token::extensions::identity::{IdentityCheck, IdentityRegistry, InMemoryIdentityRegistry};
 use fhe::token::extensions::observer::Observers;
 use fhe::token::extensions::restricted::{Restriction, RestrictionMode, Restrictions};
@@ -13,6 +14,7 @@ use rand::rng;
 const ALICE: Account = 1;
 const BOB: Account = 2;
 const EVE: Account = 4;
+const FREEZER: Account = 9;
 
 fn toy_token() -> ConfidentialToken {
     let mut rng = rng();
@@ -213,4 +215,186 @@ fn recipient_observer_sees_recipient_activity_only() {
     assert_eq!(token.decrypt_for(bob_balance, EVE, &mut rng).unwrap(), 30);
     assert_eq!(token.decrypt_for(amount_handle, EVE, &mut rng).unwrap(), 30);
     assert!(!token.is_allowed(token.balance_handle(ALICE).unwrap(), EVE));
+}
+
+/// confidential_available = balance - frozen, saturating at zero, on
+/// 100+ random (balance, frozen) pairs including frozen = 0, frozen =
+/// balance, and frozen > balance — all threshold-decrypted against a
+/// plaintext reference.
+#[test]
+fn available_matches_plaintext_reference_on_random_pairs() {
+    use rand::Rng;
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut freezable = Freezable::new(FREEZER);
+
+    let mut pairs: Vec<(u64, u64)> = vec![(1000, 0), (1000, 1000), (1000, 1001), (0, 0), (0, 5)];
+    while pairs.len() < 100 {
+        let balance = rng.random_range(0..1u64 << 20);
+        let frozen = rng.random_range(0..1u64 << 21);
+        pairs.push((balance, frozen));
+    }
+
+    for (i, (balance, frozen)) in pairs.into_iter().enumerate() {
+        let account = 1000 + i as Account;
+        token.mint(account, balance, &mut rng).unwrap();
+        let enc_frozen = token.committee().encrypt(frozen, &mut rng).unwrap();
+        freezable
+            .set_confidential_frozen(&mut token, FREEZER, account, enc_frozen)
+            .unwrap();
+        let available = freezable
+            .confidential_available(&mut token, account, &mut rng)
+            .unwrap();
+        assert_eq!(
+            token.decrypt_for(available, account, &mut rng).unwrap(),
+            balance.saturating_sub(frozen),
+            "available of balance {balance}, frozen {frozen}"
+        );
+    }
+}
+
+/// Guard semantics: with balance 1000 and frozen 600, a transfer of 401
+/// silently zeroes (balances unchanged, amount decrypts to 0) and a
+/// transfer of 400 succeeds — and an observer of handles and call traces
+/// cannot distinguish the zeroed case from a zero-amount transfer (same
+/// assertions as the core never-revert test: both rotate handles, both
+/// produce an amount ciphertext, both complete Ok).
+#[test]
+fn freezable_transfer_over_available_silently_zeroes() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut freezable = Freezable::new(FREEZER);
+    token.mint(ALICE, 1000, &mut rng).unwrap();
+    token.mint(BOB, 50, &mut rng).unwrap();
+    let frozen = token.committee().encrypt(600, &mut rng).unwrap();
+    freezable
+        .set_confidential_frozen(&mut token, FREEZER, ALICE, frozen)
+        .unwrap();
+
+    // 401 > available 400: silent zero.
+    let alice_before = token.balance_handle(ALICE).unwrap();
+    let bob_before = token.balance_handle(BOB).unwrap();
+    let enc = token.committee().encrypt(401, &mut rng).unwrap();
+    let zeroed = freezable
+        .transfer(&mut token, ALICE, BOB, &enc, &mut rng)
+        .unwrap();
+    assert_eq!(token.decrypt_for(zeroed, ALICE, &mut rng).unwrap(), 0);
+    assert_eq!(token.decrypt_for(zeroed, BOB, &mut rng).unwrap(), 0);
+    assert_eq!(balance_of(&token, ALICE), 1000);
+    assert_eq!(balance_of(&token, BOB), 50);
+    // The call trace looks exactly like a successful transfer: handles
+    // rotated, an amount ciphertext exists, the audit entry has the same
+    // shape (two comparisons, two refreshes).
+    assert_ne!(token.balance_handle(ALICE).unwrap(), alice_before);
+    assert_ne!(token.balance_handle(BOB).unwrap(), bob_before);
+
+    // 400 == available: succeeds.
+    let enc = token.committee().encrypt(400, &mut rng).unwrap();
+    let moved = freezable
+        .transfer(&mut token, ALICE, BOB, &enc, &mut rng)
+        .unwrap();
+    assert_eq!(token.decrypt_for(moved, ALICE, &mut rng).unwrap(), 400);
+    assert_eq!(balance_of(&token, ALICE), 600);
+    assert_eq!(balance_of(&token, BOB), 450);
+
+    // Indistinguishable audit shapes between the zeroed and successful
+    // transfers.
+    let log = freezable.audit_log();
+    assert_eq!(log.len(), 2);
+    for audit in log {
+        assert_eq!(audit.refreshes.len(), 2);
+        assert_eq!(
+            audit.available_compare.blinds.len(),
+            audit.guard_compare.blinds.len()
+        );
+    }
+}
+
+/// Only the freezer role may set frozen amounts.
+#[test]
+fn only_freezer_sets_frozen_amounts() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut freezable = Freezable::new(FREEZER);
+    assert_eq!(freezable.freezer(), FREEZER);
+    token.mint(ALICE, 100, &mut rng).unwrap();
+
+    let frozen = token.committee().encrypt(10, &mut rng).unwrap();
+    assert!(
+        freezable
+            .set_confidential_frozen(&mut token, ALICE, ALICE, frozen)
+            .is_err()
+    );
+    assert_eq!(freezable.confidential_frozen(ALICE), None);
+
+    let frozen = token.committee().encrypt(10, &mut rng).unwrap();
+    let handle = freezable
+        .set_confidential_frozen(&mut token, FREEZER, ALICE, frozen)
+        .unwrap();
+    // The frozen handle is ACL'd to the account and the freezer only.
+    assert_eq!(token.decrypt_for(handle, ALICE, &mut rng).unwrap(), 10);
+    assert_eq!(token.decrypt_for(handle, FREEZER, &mut rng).unwrap(), 10);
+    assert!(token.decrypt_for(handle, BOB, &mut rng).is_err());
+}
+
+/// Leakage: the freezable transfer's extra comparison (the saturation
+/// guard) appears in the audit log, and the single-party-view assertions
+/// from the core token's e2e pass over BOTH comparisons — no transcript
+/// value is a raw operand, and no single party can unblind the true
+/// difference.
+#[test]
+fn freezable_audit_log_leaks_no_raw_operands() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut freezable = Freezable::new(FREEZER);
+    let (balance, frozen_amount, amount) = (1000u64, 600u64, 401u64);
+    token.mint(ALICE, balance, &mut rng).unwrap();
+    let frozen = token.committee().encrypt(frozen_amount, &mut rng).unwrap();
+    freezable
+        .set_confidential_frozen(&mut token, FREEZER, ALICE, frozen)
+        .unwrap();
+    let enc = token.committee().encrypt(amount, &mut rng).unwrap();
+    freezable
+        .transfer(&mut token, ALICE, BOB, &enc, &mut rng)
+        .unwrap();
+
+    let available = balance.saturating_sub(frozen_amount);
+    let audit = &freezable.audit_log()[0];
+    // (transcript, lhs, rhs) for both comparisons of the transfer.
+    let comparisons = [
+        (&audit.available_compare, balance, frozen_amount),
+        (&audit.guard_compare, available, amount),
+    ];
+    for (compare, lhs, rhs) in comparisons {
+        let true_difference = lhs.wrapping_sub(rhs);
+        let revealed = compare.revealed;
+        assert_ne!(revealed, lhs);
+        assert_ne!(revealed, rhs);
+        assert_ne!(revealed, true_difference);
+        for blind in &compare.blinds {
+            assert!(*blind >= 3);
+            let partially_unblinded = (revealed as i64).unsigned_abs() / blind;
+            let residual = if (revealed as i64) < 0 {
+                (partially_unblinded as i64).wrapping_neg() as u64
+            } else {
+                partially_unblinded
+            };
+            assert_ne!(residual, true_difference);
+        }
+    }
+    // Refresh transcripts: removing any single party's own mask never
+    // exposes a raw operand.
+    for refresh in &audit.refreshes {
+        for mask in &refresh.masks {
+            let view = refresh.revealed.wrapping_sub(*mask);
+            assert_ne!(view, balance);
+            assert_ne!(view, frozen_amount);
+            assert_ne!(view, amount);
+        }
+    }
+    // The standalone available query logs its comparison too.
+    freezable
+        .confidential_available(&mut token, ALICE, &mut rng)
+        .unwrap();
+    assert_eq!(freezable.available_compares().len(), 1);
 }
