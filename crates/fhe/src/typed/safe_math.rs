@@ -107,7 +107,7 @@ pub fn select(bit: &FheUint64, x: &FheUint64, y: &FheUint64) -> FheUint64 {
 /// TFHE/fhEVM cmux. `try_add`/`try_sub` use it deliberately so that a
 /// guarded update consumes one multiplicative level of the value it
 /// guards — see the module-level "Noise lifecycle" section.
-fn cmux<R: RngCore + CryptoRng>(
+pub(crate) fn cmux<R: RngCore + CryptoRng>(
     committee: &Committee,
     bit: &FheUint64,
     x: &FheUint64,

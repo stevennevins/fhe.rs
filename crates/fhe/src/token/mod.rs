@@ -53,9 +53,9 @@ use std::collections::{HashMap, HashSet};
 
 use rand::{CryptoRng, RngCore};
 
-use crate::gateway::Committee;
+use crate::gateway::{Committee, CompareTranscript, RefreshTranscript};
 use crate::typed::FheUint64;
-use crate::typed::safe_math::{MAX_SAFE_VALUE, select, try_sub};
+use crate::typed::safe_math::{MAX_SAFE_VALUE, cmux, select};
 use crate::{Error, Result};
 
 /// An account identifier. The token does no signature checking — caller
@@ -78,6 +78,21 @@ pub enum RefreshPolicy {
     /// Never refresh. Balances die of noise after two transfers; exists
     /// so tests can prove the refresh is load-bearing.
     Never,
+}
+
+/// The committee's view of one transfer: the comparison transcript of the
+/// balance guard and the refresh transcripts of the touched balances.
+///
+/// Kept by the token so the leakage claims of [`crate::gateway`] can be
+/// audited against the comparisons *actually performed* by transfers —
+/// "no single party's view contains a raw operand" is asserted by the
+/// end-to-end test over this log.
+pub struct TransferAudit {
+    /// The balance-guard comparison (`from_balance >= amount`).
+    pub compare: CompareTranscript,
+    /// The refreshes of the touched balances (empty under
+    /// [`RefreshPolicy::Never`]).
+    pub refreshes: Vec<RefreshTranscript>,
 }
 
 /// A confidential token: encrypted balances under a committee's
@@ -119,6 +134,7 @@ pub struct ConfidentialToken {
     /// tracks no secret. Used to enforce the safe-math domain bound.
     minted: u64,
     next_handle: u64,
+    audit_log: Vec<TransferAudit>,
 }
 
 impl ConfidentialToken {
@@ -147,6 +163,7 @@ impl ConfidentialToken {
             total_supply,
             minted: 0,
             next_handle: 0,
+            audit_log: Vec::new(),
         })
     }
 
@@ -161,6 +178,20 @@ impl ConfidentialToken {
     #[must_use]
     pub fn total_supply(&self) -> &FheUint64 {
         &self.total_supply
+    }
+
+    /// The committee's view of every transfer performed so far, for
+    /// leakage auditing.
+    #[must_use]
+    pub fn audit_log(&self) -> &[TransferAudit] {
+        &self.audit_log
+    }
+
+    /// Every handle the token has stored a ciphertext under, for ACL
+    /// auditing.
+    #[must_use]
+    pub fn handles(&self) -> Vec<Handle> {
+        self.store.keys().copied().collect()
     }
 
     /// The current balance handle of `account`, if it has ever held
@@ -276,9 +307,20 @@ impl ConfidentialToken {
             None => self.committee.encrypt(0, rng)?,
         };
 
-        // Guarded sender update: on insufficient balance the subtraction
-        // rolls back and the success bit encrypts 0.
-        let (success, new_from) = try_sub(&self.committee, &from_balance, amount, rng)?;
+        // The transfer guard, with its transcript kept for the audit log.
+        // This is `try_sub`'s circuit inlined so the comparison transcript
+        // can be recorded: a guarded sender update that rolls back on
+        // insufficient balance.
+        let (success, compare) =
+            self.committee
+                .compare_ge_with_transcript(&from_balance, amount, rng)?;
+        let new_from = cmux(
+            &self.committee,
+            &success,
+            &(&from_balance - amount),
+            &from_balance,
+            rng,
+        )?;
         // The actually-transferred amount: `amount` on success, 0 on
         // failure — indistinguishable ciphertexts either way.
         let zero = self.committee.encrypt(0, rng)?;
@@ -287,15 +329,25 @@ impl ConfidentialToken {
         // independent try_add: its overflow guard could in principle
         // disagree and break supply conservation; minted supply is bounded
         // at mint time, so the receiver sum cannot leave the domain).
-        let (_, new_to) = try_add_with_bit(&self.committee, &to_balance, &actual, &success, rng)?;
+        let new_to = cmux(
+            &self.committee,
+            &success,
+            &(&to_balance + &actual),
+            &to_balance,
+            rng,
+        )?;
 
+        let mut refreshes = Vec::new();
         let (new_from, new_to) = match self.refresh_policy {
-            RefreshPolicy::EveryTransfer => (
-                self.committee.refresh(&new_from, rng)?,
-                self.committee.refresh(&new_to, rng)?,
-            ),
+            RefreshPolicy::EveryTransfer => {
+                let (new_from, t_from) = self.committee.refresh_with_transcript(&new_from, rng)?;
+                let (new_to, t_to) = self.committee.refresh_with_transcript(&new_to, rng)?;
+                refreshes.extend([t_from, t_to]);
+                (new_from, new_to)
+            }
             RefreshPolicy::Never => (new_from, new_to),
         };
+        self.audit_log.push(TransferAudit { compare, refreshes });
 
         self.store_balance(from, new_from);
         self.store_balance(to, new_to);
@@ -330,20 +382,4 @@ impl ConfidentialToken {
         self.store.insert(handle, ct);
         handle
     }
-}
-
-/// `try_add`'s guarded update with an externally supplied success bit
-/// instead of a fresh overflow comparison: `bit*(a+b) + (1-bit)*a`.
-fn try_add_with_bit<R: RngCore + CryptoRng>(
-    committee: &Committee,
-    a: &FheUint64,
-    b: &FheUint64,
-    bit: &FheUint64,
-    rng: &mut R,
-) -> Result<(FheUint64, FheUint64)> {
-    let one = committee.encrypt(1, rng)?;
-    let not_bit = &one - bit;
-    let sum = a + b;
-    let result = &(bit * &sum) + &(&not_bit * a);
-    Ok((bit.clone(), result))
 }
