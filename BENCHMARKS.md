@@ -146,3 +146,33 @@ CUDA time.
   warm-up, large-batch numbers degraded up to 4× from clock ramping.)
 - Out-of-device-memory or any other CUDA failure falls back to the CPU
   path (no abort, no error surfaced through the unchanged public API).
+
+## Typed FheGoldilocks SIMD operations
+
+Wall-clock medians for the typed `fhe::typed::FheGoldilocks` API
+(plaintext modulus t = 2^64 − 2^32 + 1, the Plonky2/Plonky3 field) at the
+curated 128-bit parameters: degree 16384, six moduli (291-bit q). Every
+operation processes all 16384 SIMD slots at once; the per-slot column is
+the CUDA time divided by 16384 (throughput, not latency — a single
+operation costs the full wall time regardless of how many slots are used).
+
+Reproduce with:
+
+```bash
+cargo run --release -p fhe --example goldilocks_timing                  # CPU
+cargo run --release -p fhe --example goldilocks_timing --features cuda  # GPU
+```
+
+| Op | CPU | CUDA | speedup | per slot (CUDA) |
+|---|---|---|---|---|
+| `encrypt_slots` (16384 values) | 33.7 ms | 28.2 ms | 1.2× | ~1.7 µs |
+| `+` (slot-wise add) | 0.26 ms | 0.25 ms | ±0 (CPU) | ~15 ns |
+| `*` + relinearization | 131.1 ms | 26.7 ms | **4.9×** | ~1.6 µs |
+| `decrypt_slots` | 38.8 ms | 35.1 ms | 1.1× | ~2.1 µs |
+
+The typed multiply (26.7 ms) is slower than the raw `mul_relin` grid row
+at the same n = 16384, k = 6 (11.8 ms) because the hotpaths grid uses a
+small plaintext modulus: a ~2^64 modulus pays extra in the BigUint
+plaintext scaling path. That is the documented noise/scaling cost of
+64-bit t, not typed-layer overhead. Encrypt/decrypt/add are dominated by
+CPU-side encoding and stay near the CPU times.
