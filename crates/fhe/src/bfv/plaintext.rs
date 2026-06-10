@@ -311,8 +311,8 @@ impl FheDecoder<Plaintext> for Vec<BigUint> {
             EncodingEnum::Poly => Ok(w),
             EncodingEnum::Simd => {
                 if let Some(op) = &pt.par.ntt_operator {
-                    // NTT operator works on u64.
-                    // If ntt_operator exists, it means we are in Small modulus case.
+                    // The NTT operator works on u64. It only exists when the
+                    // plaintext modulus fits in a u64, so values (< t) fit too.
                     let mut w_u64: Vec<u64> = w.iter().map(|x| x.to_u64().unwrap()).collect();
                     op.forward(&mut w_u64);
                     let mut w_reordered = w_u64.clone();

@@ -4,7 +4,7 @@ use crate::bfv::{context::CipherPlainContext, context::ContextLevel};
 use crate::proto::bfv::{Parameters, parameters::PlaintextModulus as PlaintextModulusProto};
 use crate::{Error, ParametersError, Result, SerializationError};
 use fhe_math::{
-    ntt::NttOperator,
+    ntt::{Ntt64Operator, NttOperator},
     rns::{RnsContext, ScalingFactor},
     rq::{Context, Poly, PowerBasis, scaler::Scaler, traits::TryConvertFrom},
     zq::{Modulus, primes::generate_prime},
@@ -68,6 +68,47 @@ impl PlaintextModulus {
     }
 }
 
+/// NTT operator over the plaintext modulus, used for SIMD encoding.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PlaintextNtt {
+    /// Moduli below 2^62, handled by the constant-time `Modulus`-based
+    /// operator.
+    Small(Arc<NttOperator>),
+    /// NTT-friendly primes of 62 to 64 bits (e.g. Goldilocks). This operator
+    /// is variable-time; acceptable on the plaintext encode/decode path.
+    Large(Arc<Ntt64Operator>),
+}
+
+impl PlaintextNtt {
+    pub fn forward(&self, a: &mut [u64]) {
+        match self {
+            Self::Small(op) => op.forward(a),
+            Self::Large(op) => op.forward(a),
+        }
+    }
+
+    pub fn backward(&self, a: &mut [u64]) {
+        match self {
+            Self::Small(op) => op.backward(a),
+            Self::Large(op) => op.backward(a),
+        }
+    }
+
+    /// Compute the backward NTT in place in variable time.
+    ///
+    /// # Safety
+    /// `a_ptr` must point to at least `degree` elements. This function is not
+    /// constant time and its timing may reveal the values being transformed.
+    pub unsafe fn backward_vt(&self, a_ptr: *mut u64) {
+        match self {
+            Self::Small(op) => unsafe { op.backward_vt(a_ptr) },
+            Self::Large(op) => {
+                op.backward(unsafe { std::slice::from_raw_parts_mut(a_ptr, op.size()) })
+            }
+        }
+    }
+}
+
 /// Parameters for the BFV encryption scheme.
 ///
 /// This struct consolidates all parameter-specific data and pre-computed values
@@ -91,7 +132,7 @@ pub struct BfvParameters {
     pub(crate) context_chain: Arc<ContextLevel>,
 
     /// NTT operator for SIMD plaintext operations, if possible
-    pub(crate) ntt_operator: Option<Arc<NttOperator>>,
+    pub(crate) ntt_operator: Option<PlaintextNtt>,
 
     /// Plaintext Modulus as a Modulus type or BigUint
     pub(crate) plaintext: PlaintextModulus,
@@ -497,12 +538,17 @@ impl BfvParametersBuilder {
         let plaintext_context = Context::new_arc(&moduli[..plaintext_moduli_count], self.degree)?;
 
         // Create NTT operator for SIMD operations if possible
-        // Only if plaintext modulus fits in u64 for now
         let ntt_operator = match &plaintext_modulus_struct {
             PlaintextModulus::Small { modulus, .. } => {
-                NttOperator::new(modulus, self.degree).map(Arc::new)
+                NttOperator::new(modulus, self.degree).map(|op| PlaintextNtt::Small(Arc::new(op)))
             }
-            PlaintextModulus::Large(_) => None,
+            // NTT-friendly primes of 62 to 64 bits (e.g. Goldilocks) get SIMD
+            // through the u128-based operator. Moduli above 2^64 or without an
+            // NTT of this size (e.g. t = 2^64) stay None and reject SIMD.
+            PlaintextModulus::Large(m) => m
+                .to_u64()
+                .and_then(|p| Ntt64Operator::new(p, self.degree))
+                .map(|op| PlaintextNtt::Large(Arc::new(op))),
         };
 
         // Create cipher-plain bridge contexts

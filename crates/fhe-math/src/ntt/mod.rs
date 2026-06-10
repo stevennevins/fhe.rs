@@ -3,12 +3,14 @@
 use fhe_util::is_prime;
 
 mod native;
+mod native64;
 
 #[cfg(feature = "tfhe-ntt")]
 mod tfhe;
 
 #[cfg(not(feature = "tfhe-ntt"))]
 pub use native::NttOperator;
+pub use native64::Ntt64Operator;
 #[cfg(feature = "tfhe-ntt")]
 pub use tfhe::NttOperator;
 
