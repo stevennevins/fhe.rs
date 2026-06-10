@@ -66,10 +66,13 @@ CPU code (unchanged) or call the GPU routine:
 
 | Entry point (existing, unchanged signature)        | GPU routine                |
 |----------------------------------------------------|----------------------------|
-| `Poly::into_ntt` / `into_power_basis` (rq/mod.rs)  | batched NTT/INTT over all k RNS rows in one launch |
-| `Scaler::scale` (rns/scaler.rs via rq/scaler.rs)   | RNS basis extension / scaling kernels |
-| `Multiplicator::multiply` (fhe crate, bfv/mul.rs)  | fused device-resident ciphertext multiply + relinearization |
-| `dot_product` (rq/ops.rs, key switching)           | batched Hadamard-accumulate kernel |
+| `Poly::into_ntt` / `into_power_basis` (rq/mod.rs)  | batched NTT/INTT over all k RNS rows (per-stage kernels + one fused shared-memory kernel for the last 9 stages) |
+| `Scaler::scale` (rq/scaler.rs)                     | fused backward NTT → RNS basis extension/scaling kernel → forward NTT, device-resident |
+| `KeySwitchingKey::key_switch{,_assign}` (fhe crate) | fused broadcast → lazy NTT → Shoup multiply-accumulate loop with device-cached key material (covers relinearization and rotations) |
+
+`Multiplicator::multiply` is therefore GPU-accelerated end to end through
+its building blocks: 7 `Scaler::scale` calls, the NTT conversions, and the
+relinearization key switch.
 
 Element-wise `Add`/`Sub` of ciphertexts stays on the CPU **by design**: it is
 O(k·n) data for O(k·n) work and is strictly transfer-bound (see PCIe analysis).
@@ -104,21 +107,25 @@ Consequences baked into the design:
 
 ## Memory management
 
-- **Device buffer pool.** A simple free-list keyed by buffer length
-  (`HashMap<usize, Vec<CudaSlice<u64>>>`) behind a `Mutex`. Polynomials are
-  k×n `u64` matrices; sizes are few and highly repetitive, so pooling
-  eliminates `cuMemAlloc` latency from the hot path.
-- **Table cache.** Per `rq::Context` (keyed by `Arc::as_ptr`), the backend
-  uploads once: moduli, Shoup constants, concatenated forward/inverse twiddle
-  tables for every RNS modulus, and RNS conversion constants (garner /
-  scaling-matrix tables used by `Scaler`).
-- **Transfers** use ordinary pageable copies through `cudarc`'s stream-ordered
-  `memcpy_stod`/`dtos`. Pinned staging was measured (Phase 4) and only added
-  complexity for ≤ 5% on this hardware; revisit if a target platform shows
-  worse pageable bandwidth.
-- **Out-of-memory behavior:** allocation failures surface as `Error::Default`
-  from the op (for explicit GPU paths) or fall back to CPU where a CPU path
-  exists; they never abort.
+- **Device buffer pool.** A thread-local free-list keyed by buffer length
+  (`HashMap<usize, Vec<CudaSlice<u64>>>`); buffers stay associated with the
+  thread's stream. Polynomial sizes are few and highly repetitive, so
+  pooling eliminates `cuMemAlloc` latency from the hot path.
+- **Table cache.** Per (moduli list, degree) — value-keyed, so context
+  recreation reuses uploads — the backend uploads once: moduli, Barrett and
+  Shoup constants, concatenated forward/inverse twiddle tables for every
+  RNS modulus. Scaler constants (gamma/omega/theta tables) and
+  key-switching keys are cached the same way, the latter keyed by the key
+  polynomials' addresses plus content samples.
+- **Transfers** use ordinary pageable copies (`memcpy_htod`/`memcpy_dtoh`),
+  with the standalone NTT downloading directly into the caller's buffer.
+  Pinned (write-combined) staging was measured in Phase 4 and was *slower*
+  on this hardware (WC reads); pageable bandwidth is ~10–13 GB/s.
+- **Out-of-memory behavior:** every GPU path has a CPU equivalent, so
+  allocation failures (like any other CUDA error) cause a silent fall back
+  to the CPU implementation; they never abort and never corrupt data. The
+  per-thread buffer pool and key/table caches are bounded by the number of
+  distinct (moduli, degree) contexts and keys used by the application.
 
 ## Streams and concurrency
 
@@ -150,10 +157,16 @@ The GPU kernels do not invent their own arithmetic:
   GPU outputs across all supported degrees, moduli counts, edge cases, and
   1000+ random NTT∘INTT round trips.
 
-Note: the `cuda` feature is **incompatible with the `tfhe-ntt` feature** in
-the sense that bit-exactness is defined against the native `NttOperator`
-tables (mathematically the results agree regardless, since the NTT/INTT
-composition and all element-wise ops are exact mod q).
+Note: when the `tfhe-ntt` feature is also enabled, the CUDA backend is
+compiled out entirely (bit-exactness is defined against the native
+`NttOperator` tables); `cuda` + `tfhe-ntt` builds behave exactly like
+`tfhe-ntt` alone.
+
+One C1 nuance: with the `cuda` feature enabled, `fhe-math` exposes a single
+`#[doc(hidden)]` internal entry point (`__cuda_key_switch`) consumed by the
+`fhe` crate's key-switching code. The default-features API surface is
+unchanged, and the hidden item is additive (no existing downstream code is
+affected).
 
 ## Build story
 
