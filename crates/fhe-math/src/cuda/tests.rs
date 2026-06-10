@@ -279,3 +279,116 @@ fn dispatched_into_ntt_matches_cpu() {
         assert_eq!(q.coefficients().as_slice().unwrap(), &cpu[..]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// RNS scaling (Scaler::scale)
+// ---------------------------------------------------------------------------
+
+/// CPU reference replicating the CPU body of `rq::scaler::Scaler::scale`,
+/// bypassing the GPU dispatch.
+fn cpu_scale(
+    scaler: &crate::rq::scaler::Scaler,
+    coeffs: &ndarray::Array2<u64>,
+    needs_transform: bool,
+) -> ndarray::Array2<u64> {
+    use ndarray::{Axis, s};
+    let common = scaler.number_common_moduli;
+    let k_to = scaler.to.q.len();
+    let n = scaler.to.degree;
+    let mut new_coefficients = ndarray::Array2::<u64>::zeros((k_to, n));
+
+    if common > 0 {
+        new_coefficients
+            .slice_mut(s![..common, ..])
+            .assign(&coeffs.slice(s![..common, ..]));
+    }
+    if common < k_to {
+        let mut pb = coeffs.clone();
+        if needs_transform {
+            for (mut row, op) in pb.outer_iter_mut().zip(scaler.from.ops.iter()) {
+                op.backward(row.as_slice_mut().unwrap());
+            }
+        }
+        for (new_column, column) in new_coefficients
+            .slice_mut(s![common.., ..])
+            .axis_iter_mut(Axis(1))
+            .zip(pb.axis_iter(Axis(1)))
+        {
+            scaler.scaler.scale(column, new_column, common);
+        }
+        if needs_transform {
+            for (mut row, op) in new_coefficients
+                .slice_mut(s![common.., ..])
+                .outer_iter_mut()
+                .zip(scaler.to.ops[common..].iter())
+            {
+                op.forward(row.as_slice_mut().unwrap());
+            }
+        }
+    }
+    new_coefficients
+}
+
+fn check_scale_case(n: usize, k_from: usize, k_to: usize, extend: bool) {
+    use crate::rns::ScalingFactor;
+    use crate::rq::scaler::Scaler;
+    use num_bigint::BigUint;
+
+    require_gpu();
+    let from = test_ctx(n, k_from);
+    let to = if extend {
+        // The `to` context extends `from` (same prefix), factor one — the
+        // basis-extension case of BFV multiplication.
+        let mut moduli = from.moduli.to_vec();
+        let big = test_ctx(n, k_to + k_from);
+        for m in big.moduli.iter() {
+            if !moduli.contains(m) && moduli.len() < k_to {
+                moduli.push(*m);
+            }
+        }
+        Arc::new(Context::new(&moduli, n).unwrap())
+    } else {
+        test_ctx(n, k_to)
+    };
+    let factor = if extend {
+        ScalingFactor::one()
+    } else {
+        // The down-scaling case: t/Q.
+        ScalingFactor::new(&BigUint::from(1153u64), from.modulus())
+    };
+    let scaler = Scaler::new(&from, &to, factor).unwrap();
+
+    let mut rng = rand::rng();
+    for _ in 0..3 {
+        for needs_transform in [false, true] {
+            let p = Poly::<PowerBasis>::random(&from, &mut rng);
+            let coeffs = p.coefficients().to_owned();
+            let gpu = super::scale_coeffs(&scaler, &coeffs.view(), needs_transform).unwrap();
+            let cpu = cpu_scale(&scaler, &coeffs, needs_transform);
+            assert_eq!(
+                gpu, cpu,
+                "scale mismatch (n={n}, {k_from}->{k_to}, extend={extend}, ntt={needs_transform})"
+            );
+        }
+    }
+}
+
+macro_rules! scale_tests {
+    ($($name:ident: ($n:expr, $kf:expr, $kt:expr, $extend:expr),)*) => {$(
+        #[test]
+        fn $name() {
+            check_scale_case($n, $kf, $kt, $extend);
+        }
+    )*};
+}
+
+scale_tests! {
+    scale_extend_1024_4_8: (1024, 4, 8, true),
+    scale_extend_4096_3_6: (4096, 3, 6, true),
+    scale_extend_8192_6_12: (8192, 6, 12, true),
+    scale_extend_16384_15_30: (16384, 15, 30, true),
+    scale_down_4096_6_3: (4096, 6, 3, false),
+    scale_down_8192_12_6: (8192, 12, 6, false),
+    scale_down_16384_8_4: (16384, 8, 4, false),
+    scale_down_32768_15_8: (32768, 15, 8, false),
+}

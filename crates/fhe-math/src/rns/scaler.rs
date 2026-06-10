@@ -52,23 +52,23 @@ impl ScalingFactor {
 pub struct RnsScaler {
     from: Arc<RnsContext>,
     to: Arc<RnsContext>,
-    scaling_factor: ScalingFactor,
+    pub(crate) scaling_factor: ScalingFactor,
 
-    gamma: Box<[u64]>,
-    gamma_shoup: Box<[u64]>,
-    theta_gamma_lo: u64,
-    theta_gamma_hi: u64,
-    theta_gamma_sign: bool,
+    pub(crate) gamma: Box<[u64]>,
+    pub(crate) gamma_shoup: Box<[u64]>,
+    pub(crate) theta_gamma_lo: u64,
+    pub(crate) theta_gamma_hi: u64,
+    pub(crate) theta_gamma_sign: bool,
 
-    omega: Box<[Box<[u64]>]>,
-    omega_shoup: Box<[Box<[u64]>]>,
-    theta_omega_lo: Box<[u64]>,
-    theta_omega_hi: Box<[u64]>,
-    theta_omega_sign: Box<[bool]>,
+    pub(crate) omega: Box<[Box<[u64]>]>,
+    pub(crate) omega_shoup: Box<[Box<[u64]>]>,
+    pub(crate) theta_omega_lo: Box<[u64]>,
+    pub(crate) theta_omega_hi: Box<[u64]>,
+    pub(crate) theta_omega_sign: Box<[bool]>,
 
-    theta_garner_lo: Box<[u64]>,
-    theta_garner_hi: Box<[u64]>,
-    theta_garner_shift: usize,
+    pub(crate) theta_garner_lo: Box<[u64]>,
+    pub(crate) theta_garner_hi: Box<[u64]>,
+    pub(crate) theta_garner_shift: usize,
 }
 
 impl RnsScaler {

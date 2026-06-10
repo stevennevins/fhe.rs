@@ -16,10 +16,10 @@ use std::sync::Arc;
 /// Context extender.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Scaler {
-    from: Arc<Context>,
-    to: Arc<Context>,
-    number_common_moduli: usize,
-    scaler: RnsScaler,
+    pub(crate) from: Arc<Context>,
+    pub(crate) to: Arc<Context>,
+    pub(crate) number_common_moduli: usize,
+    pub(crate) scaler: RnsScaler,
 }
 
 impl Scaler {
@@ -55,6 +55,25 @@ impl Scaler {
                 "The input polynomial does not have the correct context".to_string(),
             ))
         } else {
+            // The GPU path performs the (optional) backward NTT, the RNS
+            // scaling, and the forward NTT device-resident, with bit-exact
+            // results; it falls back to the CPU code below when unavailable.
+            #[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+            if let Some(new_coefficients) = crate::cuda::scale_coeffs(
+                self,
+                &p.coefficients.view(),
+                R::REPRESENTATION != Representation::PowerBasis,
+            ) {
+                return Ok(Poly {
+                    ctx: self.to.clone(),
+                    allow_variable_time_computations: p.allow_variable_time_computations,
+                    coefficients: new_coefficients,
+                    coefficients_shoup: None,
+                    has_lazy_coefficients: false,
+                    _repr: PhantomData,
+                });
+            }
+
             let mut new_coefficients = Array2::<u64>::zeros((self.to.q.len(), self.to.degree));
 
             if self.number_common_moduli > 0 {

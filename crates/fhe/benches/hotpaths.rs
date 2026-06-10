@@ -4,8 +4,8 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use fhe::bfv::{
-    BfvParameters, BfvParametersBuilder, Ciphertext, Encoding, EvaluationKeyBuilder,
-    Multiplicator, Plaintext, RelinearizationKey, SecretKey,
+    BfvParameters, BfvParametersBuilder, Ciphertext, Encoding, EvaluationKeyBuilder, Multiplicator,
+    Plaintext, RelinearizationKey, SecretKey,
 };
 use fhe_math::rq::{Context, Ntt, Poly, PowerBasis};
 use fhe_traits::{FheEncoder, FheEncrypter};
@@ -66,10 +66,7 @@ pub fn ntt_grid_benchmark(c: &mut Criterion) {
                     .map(|_| Poly::<PowerBasis>::random(&ctx, &mut rng))
                     .collect_vec();
                 group.bench_function(
-                    BenchmarkId::new(
-                        "forward_batch64",
-                        format!("n={degree}/k={nmoduli}"),
-                    ),
+                    BenchmarkId::new("forward_batch64", format!("n={degree}/k={nmoduli}")),
                     |b| {
                         b.iter(|| {
                             for p in &batch {
@@ -112,9 +109,7 @@ pub fn ciphertext_grid_benchmark(c: &mut Criterion) {
 
             let id = format!("n={degree}/k={nmoduli}");
 
-            group.bench_function(BenchmarkId::new("add_ct", &id), |b| {
-                b.iter(|| &c1 + &c2)
-            });
+            group.bench_function(BenchmarkId::new("add_ct", &id), |b| b.iter(|| &c1 + &c2));
 
             let multiplicator = Multiplicator::default(&rk).unwrap();
             group.bench_function(BenchmarkId::new("mul_relin", &id), |b| {

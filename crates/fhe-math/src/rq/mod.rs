@@ -569,6 +569,31 @@ impl Poly<Ntt> {
     }
 }
 
+#[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+impl Poly<Ntt> {
+    /// Builds a polynomial from GPU-computed coefficients (CUDA backend).
+    /// The result is marked variable-time, matching the CPU key-switch path
+    /// it replaces.
+    pub(crate) fn from_gpu_coefficients(ctx: &Arc<Context>, coefficients: Array2<u64>) -> Self {
+        Self {
+            ctx: ctx.clone(),
+            has_lazy_coefficients: false,
+            allow_variable_time_computations: true,
+            coefficients,
+            coefficients_shoup: None,
+            _repr: PhantomData,
+        }
+    }
+}
+
+impl Poly<NttShoup> {
+    #[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+    /// The Shoup representation of the coefficients (CUDA backend).
+    pub(crate) fn coefficients_shoup(&self) -> Option<ArrayView2<'_, u64>> {
+        self.coefficients_shoup.as_ref().map(|c| c.view())
+    }
+}
+
 impl Poly<NttShoup> {
     /// Borrowed conversion to PowerBasis.
     #[must_use]

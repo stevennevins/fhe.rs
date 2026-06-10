@@ -15,6 +15,11 @@ pub mod zq;
 
 pub use errors::{Error, Result};
 
+/// Internal GPU entry point consumed by the `fhe` crate; not public API.
+#[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+#[doc(hidden)]
+pub use cuda::key_switch as __cuda_key_switch;
+
 #[cfg(test)]
 #[macro_use]
 extern crate proptest;
