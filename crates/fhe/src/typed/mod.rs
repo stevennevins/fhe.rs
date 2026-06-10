@@ -86,6 +86,7 @@
 //!   bounded by the parameters; see [`FheUint64::default_parameters_128`].
 
 mod goldilocks;
+pub mod safe_math;
 pub use goldilocks::{FheGoldilocks, GOLDILOCKS_MODULUS};
 
 use std::cell::RefCell;
