@@ -174,7 +174,7 @@ impl Client {
     /// design. Errors are public-policy reverts (pause, blocklist,
     /// identity, input ownership).
     pub async fn transfer(&self, to: Address, input: B256) -> Result<()> {
-        transact!(self, self.gateway.transfer(to, input)).map(drop)
+        transact!(self, self.gateway.confidentialTransfer(to, input)).map(drop)
     }
 
     /// Unwraps a registered encrypted input back to the caller's public
@@ -182,7 +182,7 @@ impl Client {
     /// documented leakage); returns `(amount, success)` — an
     /// insufficient balance is a PUBLIC failed outcome, not an error.
     pub async fn unwrap(&self, input: B256) -> Result<(u64, bool)> {
-        let log = transact!(self, self.gateway.requestUnwrap(input))?;
+        let log = transact!(self, self.gateway.unwrap(input))?;
         let event = log
             .log_decode::<gw::UnwrapFulfilled>()
             .map_err(chain_err)?
@@ -242,7 +242,7 @@ impl Client {
     pub async fn balance(&self, account: Address) -> Result<u64> {
         let handle = self
             .gateway
-            .balanceHandle(account)
+            .confidentialBalanceOf(account)
             .call()
             .await
             .map_err(chain_err)?;
@@ -253,7 +253,7 @@ impl Client {
     pub async fn frozen(&self, account: Address) -> Result<u64> {
         let handle = self
             .gateway
-            .frozenHandle(account)
+            .confidentialFrozen(account)
             .call()
             .await
             .map_err(chain_err)?;

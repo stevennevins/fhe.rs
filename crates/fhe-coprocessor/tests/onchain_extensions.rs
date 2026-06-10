@@ -62,7 +62,11 @@ async fn extensions_drive_by_transaction() {
 
     // --- setObserver: msg.sender IS the account (closes the Goal E
     // unauthenticated set_observer caveat). ---
-    let pre_observer_handle = gateway.balanceHandle(alice.address).call().await.unwrap();
+    let pre_observer_handle = gateway
+        .confidentialBalanceOf(alice.address)
+        .call()
+        .await
+        .unwrap();
     as_alice.set_observer(eve.address).await.unwrap();
     // A different sender CANNOT touch alice's observer: bob's call sets
     // bob's own observer only.
@@ -92,7 +96,11 @@ async fn extensions_drive_by_transaction() {
         .set_frozen(alice.address, frozen_700)
         .await
         .unwrap();
-    let frozen_handle = gateway.frozenHandle(alice.address).call().await.unwrap();
+    let frozen_handle = gateway
+        .confidentialFrozen(alice.address)
+        .call()
+        .await
+        .unwrap();
     assert_ne!(frozen_handle, [0u8; 32]);
     // ACL: the frozen account reads its own frozen amount.
     assert_eq!(as_alice.frozen(alice.address).await.unwrap(), 700);
@@ -139,7 +147,11 @@ async fn extensions_drive_by_transaction() {
     assert_eq!(as_alice.balance(alice.address).await.unwrap(), 0);
     assert_eq!(as_wallet2.balance(wallet2.address).await.unwrap(), 650);
     assert_eq!(
-        gateway.frozenHandle(alice.address).call().await.unwrap(),
+        gateway
+            .confidentialFrozen(alice.address)
+            .call()
+            .await
+            .unwrap(),
         [0u8; 32]
     );
     assert_eq!(as_wallet2.frozen(wallet2.address).await.unwrap(), 650);
@@ -164,11 +176,19 @@ async fn extensions_drive_by_transaction() {
     assert_eq!(as_bob.public_balance(bob.address).await.unwrap(), 150);
     // A failed unwrap (10000 > 200): fulfills as a public failure,
     // credits nothing, leaves the balance handle untouched.
-    let handle_before = gateway.balanceHandle(bob.address).call().await.unwrap();
+    let handle_before = gateway
+        .confidentialBalanceOf(bob.address)
+        .call()
+        .await
+        .unwrap();
     let unwrap_10000 = as_bob.encrypt_input(10_000).await.unwrap();
     assert_eq!(as_bob.unwrap(unwrap_10000).await.unwrap(), (10_000, false));
     assert_eq!(
-        gateway.balanceHandle(bob.address).call().await.unwrap(),
+        gateway
+            .confidentialBalanceOf(bob.address)
+            .call()
+            .await
+            .unwrap(),
         handle_before
     );
     assert_eq!(as_bob.public_balance(bob.address).await.unwrap(), 150);

@@ -54,9 +54,9 @@ async fn crash_and_restart_resumes_from_the_last_fulfilled_request() {
     // Two transfers and an observer change are requested...
     let transfer_a = as_alice.encrypt_input(100).await.unwrap();
     let transfer_b = as_alice.encrypt_input(50).await.unwrap();
-    request!(raw_alice.transfer(bob.address, transfer_a));
+    request!(raw_alice.confidentialTransfer(bob.address, transfer_a));
     request!(raw_alice.setObserver(bob.address));
-    request!(raw_alice.transfer(bob.address, transfer_b));
+    request!(raw_alice.confidentialTransfer(bob.address, transfer_b));
 
     // ...but the loop dies after fulfilling only the FIRST of them.
     let crash_after = raw_agent.lastFulfilledId().call().await.unwrap() + 1;

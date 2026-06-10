@@ -117,7 +117,7 @@ contract ConfidentialTokenGatewayTest {
         vm.prank(COPROCESSOR);
         gateway.fulfillAck(id);
         vm.prank(ALICE);
-        gateway.transfer(BOB, bytes32(uint256(0xA)));
+        gateway.confidentialTransfer(BOB, bytes32(uint256(0xA)));
         id = gateway.lastFulfilledId() + 1;
         // Right id, wrong payload (recipient swapped for the sender).
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.RequestMismatch.selector, id));
@@ -148,7 +148,7 @@ contract ConfidentialTokenGatewayTest {
             abi.encodeWithSelector(ConfidentialTokenGateway.UnknownInput.selector, bytes32(uint256(0xDEAD)))
         );
         vm.prank(ALICE);
-        gateway.transfer(BOB, bytes32(uint256(0xDEAD)));
+        gateway.confidentialTransfer(BOB, bytes32(uint256(0xDEAD)));
     }
 
     function testTransferRejectsInputOwnedByAnotherAccount() public {
@@ -160,7 +160,7 @@ contract ConfidentialTokenGatewayTest {
             abi.encodeWithSelector(ConfidentialTokenGateway.NotInputOwner.selector, bytes32(uint256(0xA)), BOB)
         );
         vm.prank(BOB);
-        gateway.transfer(ALICE, bytes32(uint256(0xA)));
+        gateway.confidentialTransfer(ALICE, bytes32(uint256(0xA)));
     }
 
     function testReanchoringAHandleReverts() public {
@@ -179,7 +179,7 @@ contract ConfidentialTokenGatewayTest {
         // Unverified recipient.
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.RecipientNotVerified.selector, BOB));
         vm.prank(ALICE);
-        gateway.transfer(BOB, bytes32(uint256(0xA)));
+        gateway.confidentialTransfer(BOB, bytes32(uint256(0xA)));
 
         vm.prank(AGENT);
         gateway.setVerified(BOB, true);
@@ -189,7 +189,7 @@ contract ConfidentialTokenGatewayTest {
         gateway.setPaused(true);
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.TransfersPaused.selector));
         vm.prank(ALICE);
-        gateway.transfer(BOB, bytes32(uint256(0xA)));
+        gateway.confidentialTransfer(BOB, bytes32(uint256(0xA)));
         vm.prank(AGENT);
         gateway.setPaused(false);
 
@@ -198,14 +198,14 @@ contract ConfidentialTokenGatewayTest {
         gateway.setBlocked(ALICE, true);
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.AccountBlocked.selector, ALICE));
         vm.prank(ALICE);
-        gateway.transfer(BOB, bytes32(uint256(0xA)));
+        gateway.confidentialTransfer(BOB, bytes32(uint256(0xA)));
         vm.prank(AGENT);
         gateway.setBlocked(ALICE, false);
         vm.prank(AGENT);
         gateway.setBlocked(BOB, true);
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.AccountBlocked.selector, BOB));
         vm.prank(ALICE);
-        gateway.transfer(BOB, bytes32(uint256(0xA)));
+        gateway.confidentialTransfer(BOB, bytes32(uint256(0xA)));
     }
 
     function testAgentRoleGates() public {
@@ -247,15 +247,15 @@ contract ConfidentialTokenGatewayTest {
         gateway.setVerified(BOB, true);
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.NoBalance.selector, ALICE));
         vm.prank(ALICE);
-        gateway.transfer(BOB, bytes32(uint256(0xA)));
+        gateway.confidentialTransfer(BOB, bytes32(uint256(0xA)));
     }
 
-    function testRequestUnwrapGates() public {
+    function testUnwrapGates() public {
         // No confidential balance.
         _registerInput(bytes32(uint256(0xA)), ALICE);
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.NoBalance.selector, ALICE));
         vm.prank(ALICE);
-        gateway.requestUnwrap(bytes32(uint256(0xA)));
+        gateway.unwrap(bytes32(uint256(0xA)));
         // Funded, but spending someone else's input.
         _fundConfidential(ALICE);
         _registerInput(bytes32(uint256(0xB)), BOB);
@@ -263,21 +263,21 @@ contract ConfidentialTokenGatewayTest {
             abi.encodeWithSelector(ConfidentialTokenGateway.NotInputOwner.selector, bytes32(uint256(0xB)), ALICE)
         );
         vm.prank(ALICE);
-        gateway.requestUnwrap(bytes32(uint256(0xB)));
+        gateway.unwrap(bytes32(uint256(0xB)));
     }
 
     function testUnwrapFailureCreditsNothingAndKeepsBalanceHandle() public {
         _fundConfidential(ALICE);
         _registerInput(bytes32(uint256(0xA)), ALICE);
-        bytes32 handleBefore = gateway.balanceHandle(ALICE);
+        bytes32 handleBefore = gateway.confidentialBalanceOf(ALICE);
         uint64 publicBefore = gateway.publicBalance(ALICE);
         vm.prank(ALICE);
-        gateway.requestUnwrap(bytes32(uint256(0xA)));
+        gateway.unwrap(bytes32(uint256(0xA)));
         uint64 id = gateway.lastFulfilledId() + 1;
         vm.prank(COPROCESSOR);
         gateway.fulfillUnwrap(id, ALICE, bytes32(uint256(0xA)), 9999, false, 0, 0);
         require(gateway.publicBalance(ALICE) == publicBefore, "no credit on failure");
-        require(gateway.balanceHandle(ALICE) == handleBefore, "balance handle untouched");
+        require(gateway.confidentialBalanceOf(ALICE) == handleBefore, "balance handle untouched");
         require(gateway.lastFulfilledId() == id, "request still consumed");
     }
 

@@ -125,13 +125,13 @@ Known v1 scope cuts, also deliberate:
 |---|---|---|
 | `faucet` | credits `publicBalance` | mirrors the public ledger |
 | `wrap` | public-balance check + debit | confidential mint (+ observer grant) |
-| `transfer` | pause, blocklist, identity, input ownership | freezable double-guard transfer, observer grants |
+| `confidentialTransfer` | pause, blocklist, identity, input ownership | freezable double-guard transfer, observer grants |
 | `setObserver` | own account only (`msg.sender`) | mirrors the observer registry |
 | `setVerified` / `setBlocked` / `setPaused` | agent role; takes effect on-chain | mirrors policy state |
 | `setConfidentialFrozen` | agent role, input ownership | stores the encrypted frozen amount |
 | `forceTransfer` | agent role | core-circuit transfer (balance guard only) |
 | `recover` | agent role | full-balance move, frozen carried as encrypted `min` |
-| `requestUnwrap` | input ownership | threshold-decrypts the amount (by design), credits `publicBalance` on success via the fulfillment |
+| `unwrap` | input ownership | threshold-decrypts the amount (by design), credits `publicBalance` on success via the fulfillment |
 
 Latency of the request-tx → fulfillment-tx round trip is measured by the
 e2e harness; see the "On-chain gateway" section of `BENCHMARKS.md`.

@@ -61,7 +61,11 @@ async fn transfer_by_transaction_rotates_handles_and_hides_insufficiency() {
     as_alice.faucet(1000).await.unwrap();
     as_alice.wrap(600).await.unwrap();
 
-    let alice_handle_0 = gateway.balanceHandle(alice.address).call().await.unwrap();
+    let alice_handle_0 = gateway
+        .confidentialBalanceOf(alice.address)
+        .call()
+        .await
+        .unwrap();
     assert_ne!(alice_handle_0, [0u8; 32]);
     // The decryption read path is driven by on-chain state: alice owns
     // her balance handle, so the coprocessor decrypts it for her.
@@ -88,8 +92,16 @@ async fn transfer_by_transaction_rotates_handles_and_hides_insufficiency() {
     as_alice.transfer(bob.address, input_250).await.unwrap();
 
     // Handles rotated as evented; balances decrypt to the reference.
-    let alice_handle_1 = gateway.balanceHandle(alice.address).call().await.unwrap();
-    let bob_handle_1 = gateway.balanceHandle(bob.address).call().await.unwrap();
+    let alice_handle_1 = gateway
+        .confidentialBalanceOf(alice.address)
+        .call()
+        .await
+        .unwrap();
+    let bob_handle_1 = gateway
+        .confidentialBalanceOf(bob.address)
+        .call()
+        .await
+        .unwrap();
     assert_ne!(alice_handle_1, alice_handle_0);
     assert_ne!(bob_handle_1, [0u8; 32]);
     assert_eq!(as_alice.balance(alice.address).await.unwrap(), 350);
@@ -107,8 +119,16 @@ async fn transfer_by_transaction_rotates_handles_and_hides_insufficiency() {
     let input_1000 = as_alice.encrypt_input(1000).await.unwrap();
     as_alice.transfer(bob.address, input_1000).await.unwrap();
 
-    let alice_handle_2 = gateway.balanceHandle(alice.address).call().await.unwrap();
-    let bob_handle_2 = gateway.balanceHandle(bob.address).call().await.unwrap();
+    let alice_handle_2 = gateway
+        .confidentialBalanceOf(alice.address)
+        .call()
+        .await
+        .unwrap();
+    let bob_handle_2 = gateway
+        .confidentialBalanceOf(bob.address)
+        .call()
+        .await
+        .unwrap();
     assert_ne!(alice_handle_2, alice_handle_1);
     assert_ne!(bob_handle_2, bob_handle_1);
     assert_eq!(as_alice.balance(alice.address).await.unwrap(), 250);

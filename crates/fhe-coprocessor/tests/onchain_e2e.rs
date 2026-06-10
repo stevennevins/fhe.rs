@@ -168,7 +168,11 @@ async fn onchain_e2e() {
 
     macro_rules! balance_handle {
         ($who:expr) => {
-            gateway.balanceHandle($who.address).call().await.unwrap()
+            gateway
+                .confidentialBalanceOf($who.address)
+                .call()
+                .await
+                .unwrap()
         };
     }
     /// Sends a transfer through a client, records latency, and asserts
@@ -446,7 +450,11 @@ async fn onchain_e2e() {
         .unwrap();
     reference.transfer(lost.address, wallet2.address, 50_000);
     assert_eq!(
-        gateway.frozenHandle(lost.address).call().await.unwrap(),
+        gateway
+            .confidentialFrozen(lost.address)
+            .call()
+            .await
+            .unwrap(),
         B256::ZERO
     );
     assert_eq!(as_wallet2.frozen(wallet2.address).await.unwrap(), 20_000);
