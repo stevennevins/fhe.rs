@@ -101,6 +101,10 @@ ntt_diff_tests! {
     ntt_diff_16_2: (16, 2),
     ntt_diff_32_1: (32, 1),
     ntt_diff_256_2: (256, 2),
+    // n = 512 is the exactly-one-fused-tile boundary of the shared-memory
+    // NTT kernels.
+    ntt_diff_512_1: (512, 1),
+    ntt_diff_512_3: (512, 3),
     ntt_diff_1024_3: (1024, 3),
     ntt_diff_2048_1: (2048, 1),
     ntt_diff_4096_2: (4096, 2),
@@ -177,14 +181,17 @@ macro_rules! edge_tests {
 
 edge_tests! {
     edge_zero_8_2: (8, 2, zero_poly),
+    edge_zero_512_2: (512, 2, zero_poly),
     edge_zero_1024_3: (1024, 3, zero_poly),
     edge_zero_4096_6: (4096, 6, zero_poly),
     edge_zero_32768_2: (32768, 2, zero_poly),
     edge_qminus1_8_2: (8, 2, qminus1_poly),
+    edge_qminus1_512_2: (512, 2, qminus1_poly),
     edge_qminus1_1024_3: (1024, 3, qminus1_poly),
     edge_qminus1_4096_6: (4096, 6, qminus1_poly),
     edge_qminus1_32768_2: (32768, 2, qminus1_poly),
     edge_single_8_2: (8, 2, single_coeff_poly),
+    edge_single_512_2: (512, 2, single_coeff_poly),
     edge_single_1024_3: (1024, 3, single_coeff_poly),
     edge_single_4096_6: (4096, 6, single_coeff_poly),
     edge_single_32768_2: (32768, 2, single_coeff_poly),
@@ -441,10 +448,15 @@ fn key_switch_matches_cpu() {
             let c1s: Vec<_> = (0..3)
                 .map(|_| Poly::<NttShoup>::random(&ctx_ksk, &mut rng))
                 .collect();
-            let (g0, g1) = super::key_switch(&p, &c0s, &c1s, &ctx_ksk).unwrap();
-            let (e0, e1) = cpu_key_switch(&p, &c0s, &c1s, &ctx_ksk);
-            assert_eq!(g0.coefficients(), e0.coefficients(), "c0 mismatch");
-            assert_eq!(g1.coefficients(), e1.coefficients(), "c1 mismatch");
+            let cache = crate::CudaKskCache::default();
+            // Two calls with the same handle: the first uploads the key
+            // material, the second must hit the device cache; both bit-exact.
+            for _ in 0..2 {
+                let (g0, g1) = super::key_switch(&p, &c0s, &c1s, &ctx_ksk, &cache).unwrap();
+                let (e0, e1) = cpu_key_switch(&p, &c0s, &c1s, &ctx_ksk);
+                assert_eq!(g0.coefficients(), e0.coefficients(), "c0 mismatch");
+                assert_eq!(g1.coefficients(), e1.coefficients(), "c1 mismatch");
+            }
         }
     }
 }

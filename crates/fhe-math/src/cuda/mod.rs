@@ -91,18 +91,14 @@ type ScalerCache = HashMap<Box<[u64]>, Arc<ScalerTables>>;
 
 /// Device-resident key-switching key material: the c0/c1 polynomials (and
 /// their Shoup representations) of one `KeySwitchingKey`, flattened to
-/// k_cipher consecutive (k_ksk x n) matrices.
-struct KskTables {
+/// k_cipher consecutive (k_ksk x n) matrices. Owned by the key's
+/// [`crate::CudaKskCache`] handle, so its lifetime is tied to the key.
+pub(crate) struct KskTables {
     c0: CudaSlice<u64>,
     c0_shoup: CudaSlice<u64>,
     c1: CudaSlice<u64>,
     c1_shoup: CudaSlice<u64>,
 }
-
-/// Cache of key-switching keys, keyed by the addresses and corner values of
-/// the key polynomials (several pointers + content samples make accidental
-/// collisions after address reuse practically impossible).
-type KskCache = HashMap<Box<[u64]>, Arc<KskTables>>;
 
 /// Global CUDA state: device context, compiled module, table cache.
 pub(crate) struct CudaBackend {
@@ -110,7 +106,6 @@ pub(crate) struct CudaBackend {
     kernels: Kernels,
     tables: Mutex<TableCache>,
     scaler_tables: Mutex<ScalerCache>,
-    ksk_tables: Mutex<KskCache>,
 }
 
 /// Returns the global CUDA backend, or None if no usable device exists.
@@ -283,8 +278,22 @@ impl CudaBackend {
             ],
             ..Default::default()
         };
-        let ptx = nvrtc::compile_ptx_with_opts(include_str!("kernels.cu"), opts).ok()?;
-        let module = ctx.load_module(ptx).ok()?;
+        let ptx = match nvrtc::compile_ptx_with_opts(include_str!("kernels.cu"), opts) {
+            Ok(ptx) => ptx,
+            Err(e) => {
+                log::warn!(
+                    "CUDA backend disabled, falling back to CPU: NVRTC compilation failed: {e}"
+                );
+                return None;
+            }
+        };
+        let module = match ctx.load_module(ptx) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("CUDA backend disabled, falling back to CPU: module load failed: {e}");
+                return None;
+            }
+        };
         let kernels = Kernels {
             ntt_fwd_stage: module.load_function("ntt_fwd_stage").ok()?,
             ntt_inv_stage: module.load_function("ntt_inv_stage").ok()?,
@@ -305,7 +314,6 @@ impl CudaBackend {
             kernels,
             tables: Mutex::new(HashMap::new()),
             scaler_tables: Mutex::new(HashMap::new()),
-            ksk_tables: Mutex::new(HashMap::new()),
         })
     }
 
@@ -579,52 +587,31 @@ pub(crate) fn scale_coeffs(
     }
 }
 
-impl CudaBackend {
-    /// Returns (uploading on first use) the device-resident key material.
-    fn ksk_tables(
-        &self,
-        c0s: &[Poly<NttShoup>],
-        c1s: &[Poly<NttShoup>],
-        stream: &Arc<CudaStream>,
-    ) -> Option<Arc<KskTables>> {
-        let mut key = Vec::with_capacity(4 * c0s.len() + 2);
-        for p in c0s.iter().chain(c1s.iter()) {
-            let sl = p.coefficients();
-            let sl = sl.as_slice()?;
-            key.push(sl.as_ptr() as u64);
-            key.push(sl.len() as u64);
-            key.push(*sl.first()?);
-            key.push(*sl.last()?);
-        }
-        let key = key.into_boxed_slice();
-
-        let mut cache = self.ksk_tables.lock().ok()?;
-        if let Some(t) = cache.get(&key) {
-            return Some(t.clone());
-        }
-
-        let mut c0 = vec![];
-        let mut c0_shoup = vec![];
-        let mut c1 = vec![];
-        let mut c1_shoup = vec![];
-        for p in c0s {
-            c0.extend_from_slice(p.coefficients().as_slice()?);
-            c0_shoup.extend_from_slice(p.coefficients_shoup()?.as_slice()?);
-        }
-        for p in c1s {
-            c1.extend_from_slice(p.coefficients().as_slice()?);
-            c1_shoup.extend_from_slice(p.coefficients_shoup()?.as_slice()?);
-        }
-
-        let tables = Arc::new(KskTables {
-            c0: stream.clone_htod(&c0).ok()?,
-            c0_shoup: stream.clone_htod(&c0_shoup).ok()?,
-            c1: stream.clone_htod(&c1).ok()?,
-            c1_shoup: stream.clone_htod(&c1_shoup).ok()?,
-        });
-        cache.insert(key, tables.clone());
-        Some(tables)
+/// Uploads the device-resident key material of one key-switching key.
+fn upload_ksk_tables(
+    c0s: &[Poly<NttShoup>],
+    c1s: &[Poly<NttShoup>],
+    stream: &Arc<CudaStream>,
+) -> Option<Arc<KskTables>> {
+    let mut c0 = vec![];
+    let mut c0_shoup = vec![];
+    let mut c1 = vec![];
+    let mut c1_shoup = vec![];
+    for p in c0s {
+        c0.extend_from_slice(p.coefficients().as_slice()?);
+        c0_shoup.extend_from_slice(p.coefficients_shoup()?.as_slice()?);
     }
+    for p in c1s {
+        c1.extend_from_slice(p.coefficients().as_slice()?);
+        c1_shoup.extend_from_slice(p.coefficients_shoup()?.as_slice()?);
+    }
+
+    Some(Arc::new(KskTables {
+        c0: stream.clone_htod(&c0).ok()?,
+        c0_shoup: stream.clone_htod(&c0_shoup).ok()?,
+        c1: stream.clone_htod(&c1).ok()?,
+        c1_shoup: stream.clone_htod(&c1_shoup).ok()?,
+    }))
 }
 
 /// Fused GPU key switch: for every row i of `p`, broadcast it to the ksk
@@ -637,6 +624,10 @@ impl CudaBackend {
 /// bit-exact with the CPU path. Returns None if the GPU is unavailable, the
 /// operation is too small, or any CUDA call fails.
 ///
+/// `cache` is the key's device-cache handle: the key material is uploaded
+/// into it on first use and reused afterwards. The caller must pass the
+/// handle owned by the same key as `c0s`/`c1s`.
+///
 /// Not public API: this is an internal hook consumed by the `fhe` crate
 /// when the `cuda` feature is enabled.
 #[doc(hidden)]
@@ -646,6 +637,7 @@ pub fn key_switch(
     c0s: &[Poly<NttShoup>],
     c1s: &[Poly<NttShoup>],
     ctx_ksk: &Arc<Context>,
+    cache: &crate::CudaKskCache,
 ) -> Option<(Poly<Ntt>, Poly<Ntt>)> {
     let n = ctx_ksk.degree;
     let k_ksk = ctx_ksk.q.len();
@@ -663,7 +655,16 @@ pub fn key_switch(
     let b = backend()?;
     let stream = stream(b)?;
     let ksk_tables = b.tables(ctx_ksk, &stream)?;
-    let keys = b.ksk_tables(c0s, c1s, &stream)?;
+    // Upload the key material into the key's own handle on first use; a
+    // failed upload is not cached, so it is retried on the next call. (If
+    // two threads race, one upload wins and the other is dropped.)
+    let keys = match cache.tables.get() {
+        Some(t) => t.clone(),
+        None => {
+            let t = upload_ksk_tables(c0s, c1s, &stream)?;
+            cache.tables.get_or_init(|| t).clone()
+        }
+    };
 
     #[expect(clippy::type_complexity, reason = "internal buffer plumbing")]
     let run = || -> DriverResult<(Vec<u64>, Vec<u64>, [CudaSlice<u64>; 4])> {

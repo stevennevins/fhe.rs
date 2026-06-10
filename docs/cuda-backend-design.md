@@ -98,9 +98,10 @@ Consequences baked into the design:
    enabled) the relinearization inner product entirely device-resident, and
    download only the final two output polynomials. The arithmetic is
    O(k²·n·log n) for O(k·n) bytes moved, which is where a GPU wins big.
-3. **Key material is cached on the device.** Relinearization/Galois key
-   polynomials are uploaded once (keyed by the key's stable address /
-   generation counter) and reused across every multiply/rotation.
+3. **Key material is cached on the device.** Each `KeySwitchingKey` owns
+   an opaque per-key cache handle (`CudaKskCache`); its polynomials are
+   uploaded into it on first use and reused across every multiply/rotation,
+   and the device copy is freed when the key is dropped.
 4. **Ciphertext add/sub never goes to the GPU** unless the operands are
    already device-resident (they are not, in the current host-resident
    `Poly` model), because transfer alone exceeds CPU compute time.
@@ -114,9 +115,9 @@ Consequences baked into the design:
 - **Table cache.** Per (moduli list, degree) — value-keyed, so context
   recreation reuses uploads — the backend uploads once: moduli, Barrett and
   Shoup constants, concatenated forward/inverse twiddle tables for every
-  RNS modulus. Scaler constants (gamma/omega/theta tables) and
-  key-switching keys are cached the same way, the latter keyed by the key
-  polynomials' addresses plus content samples.
+  RNS modulus. Scaler constants (gamma/omega/theta tables) are cached the
+  same way; key-switching key material is instead owned by the key's
+  `CudaKskCache` handle, tying its device lifetime to the key itself.
 - **Transfers** use ordinary pageable copies (`memcpy_htod`/`memcpy_dtoh`),
   with the standalone NTT downloading directly into the caller's buffer.
   Pinned (write-combined) staging was measured in Phase 4 and was *slower*

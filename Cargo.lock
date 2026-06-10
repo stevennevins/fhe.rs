@@ -483,6 +483,7 @@ dependencies = [
  "fhe-traits",
  "fhe-util",
  "itertools 0.14.0",
+ "log",
  "ndarray",
  "num-bigint",
  "num-bigint-dig",
