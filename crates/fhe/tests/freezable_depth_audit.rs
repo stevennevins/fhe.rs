@@ -6,6 +6,8 @@
 //! Runs at the curated production parameters (degree 16384), NOT toy
 //! parameters.
 
+#![allow(clippy::expect_used)]
+
 use std::collections::HashMap;
 
 use fhe::gateway::Committee;

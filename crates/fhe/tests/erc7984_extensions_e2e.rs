@@ -10,6 +10,8 @@
 //! Runs at the curated production parameters (degree 16384, 291-bit q),
 //! NOT toy parameters.
 
+#![allow(clippy::indexing_slicing)]
+
 use std::collections::HashMap;
 
 use fhe::gateway::{Committee, CompareTranscript, RefreshTranscript};

@@ -2,6 +2,8 @@
 //! decryption, recryption (refresh), and the interactive comparison —
 //! including the leakage claims made in the `fhe::gateway` module docs.
 
+#![allow(clippy::indexing_slicing)]
+
 use std::sync::Arc;
 
 use fhe::gateway::{Committee, MAX_COMPARE_OPERAND};

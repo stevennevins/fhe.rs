@@ -2,6 +2,8 @@
 //! restriction modes, identity checks, and their "public check before
 //! encrypted work" guarantee.
 
+#![allow(clippy::indexing_slicing)]
+
 use fhe::gateway::Committee;
 use fhe::token::extensions::freezable::Freezable;
 use fhe::token::extensions::identity::{IdentityCheck, IdentityRegistry, InMemoryIdentityRegistry};

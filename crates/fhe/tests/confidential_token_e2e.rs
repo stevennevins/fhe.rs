@@ -9,6 +9,8 @@
 //! Runs at the curated production parameters (degree 16384, 291-bit q),
 //! NOT toy parameters.
 
+#![allow(clippy::indexing_slicing, clippy::expect_used)]
+
 use std::collections::HashMap;
 
 use fhe::gateway::Committee;
@@ -148,13 +150,13 @@ fn confidential_token_e2e() {
     assert_invariants(&token, &raw_operands);
 
     // A transfer amount travels as bytes from the sender to the service.
-    let mut transfer = |token: &mut ConfidentialToken,
-                        reference: &mut Reference,
-                        raw_operands: &mut Vec<(u64, u64)>,
-                        from: Account,
-                        to: Account,
-                        amount: u64,
-                        rng: &mut ThreadRng| {
+    let transfer = |token: &mut ConfidentialToken,
+                    reference: &mut Reference,
+                    raw_operands: &mut Vec<(u64, u64)>,
+                    from: Account,
+                    to: Account,
+                    amount: u64,
+                    rng: &mut ThreadRng| {
         let enc = token.committee().encrypt(amount, rng).unwrap();
         let enc = FheUint64::from_bytes(&enc.to_bytes(), &params).unwrap();
         raw_operands.push((reference.balances[&from], amount));
