@@ -30,7 +30,7 @@ fn params(degree: usize, nmoduli: usize) -> Arc<BfvParameters> {
 pub fn ntt_grid_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("hotpaths_ntt");
     group.sample_size(10);
-    group.warm_up_time(Duration::from_millis(500));
+    group.warm_up_time(Duration::from_secs(2));
     group.measurement_time(Duration::from_secs(2));
     let mut rng = rng();
 
@@ -84,7 +84,7 @@ pub fn ntt_grid_benchmark(c: &mut Criterion) {
 pub fn ciphertext_grid_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("hotpaths_bfv");
     group.sample_size(10);
-    group.warm_up_time(Duration::from_millis(500));
+    group.warm_up_time(Duration::from_secs(2));
     group.measurement_time(Duration::from_secs(2));
     let mut rng = rng();
 

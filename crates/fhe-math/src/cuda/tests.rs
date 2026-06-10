@@ -392,3 +392,45 @@ scale_tests! {
     scale_down_16384_8_4: (16384, 8, 4, false),
     scale_down_32768_15_8: (32768, 15, 8, false),
 }
+
+/// Concurrent GPU use from many threads must be safe and bit-exact
+/// (per-thread streams + shared table caches).
+#[test]
+fn thread_stress() {
+    require_gpu();
+    let ctx = test_ctx(8192, 6);
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let original = random_coeffs(&ctx);
+                    let mut gpu = original.clone();
+                    assert!(ntt_force_gpu(&ctx, &mut gpu, true));
+                    let mut cpu = original.clone();
+                    cpu_ntt(&ctx, &mut cpu, true);
+                    assert_eq!(gpu, cpu);
+                    assert!(ntt_force_gpu(&ctx, &mut gpu, false));
+                    assert_eq!(gpu, original);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+/// The dispatcher must keep small operations on the CPU (G4): below the
+/// size threshold the GPU entry points decline and leave data untouched.
+#[test]
+fn small_params_stay_on_cpu() {
+    require_gpu();
+    // n = 2^12 with one modulus is below MIN_NTT_ELEMS.
+    let ctx = test_ctx(4096, 1);
+    assert!(4096 < super::MIN_NTT_ELEMS);
+    let original = random_coeffs(&ctx);
+    let mut a = original.clone();
+    assert!(!super::ntt_forward(&ctx, &mut a));
+    assert_eq!(a, original, "declined dispatch must not modify data");
+}

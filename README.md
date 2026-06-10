@@ -32,6 +32,36 @@ fhe = "0.2.0"
 fhe-traits = "0.1.1"
 ```
 
+## GPU acceleration (CUDA, experimental)
+
+The `cuda` feature offloads the polynomial-arithmetic hot paths (NTT,
+RNS basis extension/scaling, key switching) to an NVIDIA GPU, which speeds
+up BFV ciphertext multiplication, relinearization, and rotation by roughly
+an order of magnitude at large parameters (see `BENCHMARKS.md`):
+
+```toml
+[dependencies]
+fhe = { version = "0.2.0", features = ["cuda"] }
+```
+
+- **Build prerequisites: none.** Kernels are CUDA C compiled at runtime by
+  NVRTC; no `nvcc` or CUDA toolkit is needed to build (the `cudarc`
+  dependency loads `libcuda`/`libnvrtc` dynamically).
+- **Runtime prerequisites:** an NVIDIA driver and the CUDA NVRTC library
+  (CUDA toolkit ≥ 12), Linux. Compute capability 7.0+ is supported.
+- **Graceful fallback:** if no usable GPU (or no driver) is present at
+  runtime, all operations transparently use the CPU path. Setting
+  `FHE_CUDA_DISABLE=1` forces the CPU path.
+- **Bit-exact:** GPU results are identical to CPU results for every
+  operation; this is enforced by differential tests
+  (`cargo test -p fhe-math --features cuda`).
+- **Known limitations:** the `cuda` feature has no effect when combined
+  with the `tfhe-ntt` feature; small parameter sets (e.g. n = 2¹², 1–2
+  moduli) partially stay on the CPU where the GPU transfer cost would
+  dominate; device memory is not zeroized.
+
+Design details live in `docs/cuda-backend-design.md`.
+
 ## Minimum supported version / toolchain
 
 Rust **1.91.1** or newer (Rust 2024 edition).

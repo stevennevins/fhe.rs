@@ -72,7 +72,68 @@ Criterion medians, single thread:
 | 32768 | 6 | 595.2 µs | 331.9 ms | 53.51 ms |
 | 32768 | 15 | 1.729 ms | 1.154 s | 309.4 ms |
 
-## Phase 4 — CUDA results
+## Phase 4 — CUDA results (gate G4)
 
-(To be filled at gate G4: same grid with `--features cuda`, speedup table,
-dispatcher heuristics, and profiling notes for any missed target.)
+Same grid with `--features cuda`, measured against the saved `cpu-main`
+baseline on the hardware above. Criterion medians; speedup = CPU baseline /
+CUDA time.
+
+### NTT (per polynomial = k rows of size n)
+
+| n | k | forward | speedup | backward | speedup | forward ×64 batch | speedup |
+|---|---|---|---|---|---|---|---|
+| 4096 | 2 | 44.0 µs | 3.9× | 49.5 µs | 3.9× | — | — |
+| 4096 | 6 | 72.2 µs | 7.2× | 77.4 µs | 7.6× | 4.81 ms | 7.0× |
+| 4096 | 15 | 152.5 µs | 8.6× | 152.7 µs | 9.7× | — | — |
+| 8192 | 2 | 63.6 µs | 5.8× | 67.7 µs | 6.2× | — | — |
+| 8192 | 6 | 123.5 µs | 9.2× | 128.1 µs | 9.9× | 8.30 ms | 8.8× |
+| 8192 | 15 | 271.0 µs | 10.5× | 280.5 µs | 11.3× | — | — |
+| 16384 | 2 | 102.4 µs | 7.9× | 106.4 µs | 8.4× | — | — |
+| 16384 | 6 | 228.5 µs | 10.7× | 228.5 µs | 11.9× | **14.96 ms** | **10.5×** |
+| 16384 | 15 | 574.4 µs | 10.7× | 533.9 µs | 12.8× | — | — |
+| 32768 | 2 | 169.7 µs | 10.2× | 174.3 µs | 11.0× | — | — |
+| 32768 | 6 | 423.0 µs | 12.4× | 461.2 µs | 12.5× | **27.53 ms** | **12.1×** |
+| 32768 | 15 | 1.025 ms | 12.8× | 1.025 ms | 14.1× | — | — |
+
+### BFV ciphertext operations
+
+| n | k | add_ct | Δ | mul_relin | speedup | rotate_columns | speedup |
+|---|---|---|---|---|---|---|---|
+| 4096 | 2 | 16.2 µs | ±0 (CPU) | 1.57 ms | 5.9× | 247.8 µs | 3.2× |
+| 4096 | 6 | 57.8 µs | ±0 (CPU) | 3.24 ms | 9.7× | 624.0 µs | 8.7× |
+| 4096 | 15 | 151.9 µs | ±0 (CPU) | 7.64 ms | 14.8× | 1.446 ms | 21.6× |
+| 8192 | 2 | 34.5 µs | ±0 (CPU) | 2.59 ms | 7.5× | 394.4 µs | 4.3× |
+| 8192 | 6 | 124.6 µs | ±0 (CPU) | 6.01 ms | 10.8× | 1.016 ms | 11.5× |
+| 8192 | 15 | 318.6 µs | ±0 (CPU) | 15.02 ms | 16.1× | 2.490 ms | 26.7× |
+| 16384 | 2 | 81.8 µs | ±0 (CPU) | 4.61 ms | 8.7× | 684.5 µs | 5.3× |
+| 16384 | 6 | 267.6 µs | ±0 (CPU) | **11.80 ms** | **11.5×** | 1.857 ms | 13.5× |
+| 16384 | 15 | 704.3 µs | ±0 (CPU) | 29.13 ms | 17.5× | 5.133 ms | 28.3× |
+| 32768 | 2 | 174.6 µs | ±0 (CPU) | 8.85 ms | 9.4× | 1.211 ms | 6.5× |
+| 32768 | 6 | 567.7 µs | ±0 (CPU) | **23.27 ms** | **14.3×** | 3.964 ms | 13.5× |
+| 32768 | 15 | 1.550 ms | ±0 (CPU) | 85.38 ms | 13.5× | 9.941 ms | 31.1× |
+
+### Acceptance criteria (G4)
+
+| Target | Result |
+|---|---|
+| mul+relin ≥ 5× at n = 2^14, ≥ 6 moduli | **11.5×** (k=6), 17.5× (k=15) ✓ |
+| mul+relin ≥ 10× at n = 2^15 | **14.3×** (k=6), 13.5× (k=15) ✓ |
+| Batched NTT (64 polys) ≥ 10× at n ≥ 2^14 | **10.5×** (2^14), **12.1×** (2^15) ✓ |
+| Ciphertext add no slower than CPU | unchanged — the dispatcher keeps add on the CPU (transfer-bound: O(k·n) bytes for O(k·n) work) ✓ |
+| Small parameters auto-CPU | ops with n·k < 2^13 elements stay on the CPU (`MIN_NTT_ELEMS`, asserted by `cuda::tests::small_params_stay_on_cpu`); above the threshold the GPU already wins (e.g. mul_relin 5.9× at n=2^12, k=2) ✓ |
+
+### Notes
+
+- The dominant cost of a standalone GPU NTT is the PCIe round trip:
+  pageable host↔device bandwidth on this (aarch64) platform measures
+  ~10–13 GB/s, vs ~40 µs of kernel time for a 2^15 × 15 transform. Pinned
+  (write-combined) staging measured *slower* (reads from WC memory) and was
+  not adopted. Ciphertext-level operations amortize transfers by fusing the
+  whole pipeline (basis extension → tensor products → scaling →
+  key-switch) on the device, which is why mul/rotate speedups exceed the
+  standalone NTT speedups.
+- The GPU idles to P8 between criterion measurements; benchmarks use a 2 s
+  warm-up so clocks are at steady state when sampling. (With a 500 ms
+  warm-up, large-batch numbers degraded up to 4× from clock ramping.)
+- Out-of-device-memory or any other CUDA failure falls back to the CPU
+  path (no abort, no error surfaced through the unchanged public API).
