@@ -92,7 +92,10 @@ use std::cell::RefCell;
 use std::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
 use std::sync::Arc;
 
-use fhe_traits::{FheDecoder, FheDecrypter, FheEncoder, FheEncrypter};
+use fhe_traits::{
+    DeserializeParametrized, FheDecoder, FheDecrypter, FheEncoder, FheEncrypter, FheParametrized,
+    Serialize,
+};
 use num_bigint::BigUint;
 use rand::{CryptoRng, RngCore};
 
@@ -115,6 +118,36 @@ impl ServerKey {
     pub fn new<R: RngCore + CryptoRng>(sk: &SecretKey, rng: &mut R) -> Result<Self> {
         Ok(Self {
             rk: RelinearizationKey::new(sk, rng)?,
+        })
+    }
+
+    /// Wraps an existing relinearization key, e.g. one generated
+    /// collectively with [`crate::mbfv::RelinKeyGenerator`].
+    #[must_use]
+    pub fn from_relinearization_key(rk: RelinearizationKey) -> Self {
+        Self { rk }
+    }
+}
+
+impl FheParametrized for ServerKey {
+    type Parameters = BfvParameters;
+}
+
+impl Serialize for ServerKey {
+    fn to_bytes(&self) -> Vec<u8> {
+        self.rk.to_bytes()
+    }
+}
+
+impl DeserializeParametrized for ServerKey {
+    type Error = Error;
+
+    /// Deserializes a server key, validating that the parameters have
+    /// plaintext modulus t = 2^64.
+    fn from_bytes(bytes: &[u8], par: &Arc<BfvParameters>) -> Result<Self> {
+        check_parameters(par)?;
+        Ok(Self {
+            rk: RelinearizationKey::from_bytes(bytes, par)?,
         })
     }
 }
@@ -266,6 +299,29 @@ impl FheUint64 {
     #[must_use]
     pub fn into_ciphertext(self) -> Ciphertext {
         self.ct
+    }
+}
+
+impl FheParametrized for FheUint64 {
+    type Parameters = BfvParameters;
+}
+
+impl Serialize for FheUint64 {
+    fn to_bytes(&self) -> Vec<u8> {
+        self.ct.to_bytes()
+    }
+}
+
+impl DeserializeParametrized for FheUint64 {
+    type Error = Error;
+
+    /// Deserializes a ciphertext, validating that the parameters have
+    /// plaintext modulus t = 2^64.
+    fn from_bytes(bytes: &[u8], par: &Arc<BfvParameters>) -> Result<Self> {
+        check_parameters(par)?;
+        Ok(Self {
+            ct: Ciphertext::from_bytes(bytes, par)?,
+        })
     }
 }
 
