@@ -1,6 +1,6 @@
 use std::{cmp::min, ops::Deref, sync::Arc};
 
-use fhe_math::rq::{Poly, PowerBasis, traits::TryConvertFrom};
+use fhe_math::rq::{Context, Poly, PowerBasis, traits::TryConvertFrom};
 use fhe_traits::{FheEncoder, FheEncoderVariableTime, FheParametrized, FhePlaintext};
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
@@ -12,6 +12,27 @@ use crate::{
 };
 
 use super::encoding::EncodingEnum;
+
+/// Rejects encoding at levels where the ciphertext modulus is not larger than
+/// the plaintext modulus: there, delta = floor(q/t) is zero and decryption
+/// would silently return garbage. This can only happen for large plaintext
+/// moduli (close to or above the size of the remaining ciphertext moduli).
+fn ensure_ciphertext_modulus_exceeds_plaintext(
+    ctx: &Context,
+    encoding: &Encoding,
+    par: &BfvParameters,
+) -> Result<()> {
+    if ctx.modulus() <= par.plaintext_big() {
+        return Err(Error::EncodingNotSupported {
+            encoding: encoding.encoding.to_string(),
+            reason: format!(
+                "ciphertext modulus at level {} is not larger than the plaintext modulus",
+                encoding.level
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// A wrapper around a vector of plaintext which implements the [`FhePlaintext`]
 /// trait, and therefore can be encoded to / decoded from.
@@ -52,6 +73,7 @@ impl FheEncoderVariableTime<&[u64]> for PlaintextVec {
             });
         }
         let ctx = par.context_at_level(encoding.level)?;
+        ensure_ciphertext_modulus_exceeds_plaintext(ctx, &encoding, par)?;
         let num_plaintexts = value.len().div_ceil(par.degree());
 
         Ok(PlaintextVec(
@@ -113,6 +135,7 @@ impl FheEncoder<&[BigUint]> for PlaintextVec {
             });
         }
         let ctx = par.context_at_level(encoding.level)?;
+        ensure_ciphertext_modulus_exceeds_plaintext(ctx, &encoding, par)?;
         let num_plaintexts = value.len().div_ceil(par.degree());
 
         Ok(PlaintextVec(
@@ -184,6 +207,7 @@ impl FheEncoder<&[u64]> for PlaintextVec {
             });
         }
         let ctx = par.context_at_level(encoding.level)?;
+        ensure_ciphertext_modulus_exceeds_plaintext(ctx, &encoding, par)?;
         let num_plaintexts = value.len().div_ceil(par.degree());
 
         Ok(PlaintextVec(

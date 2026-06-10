@@ -6,10 +6,16 @@
 //! available for them.
 
 use fhe::bfv::{
-    BfvParameters, BfvParametersBuilder, Ciphertext, Encoding, Plaintext, RelinearizationKey,
-    SecretKey,
+    BfvParameters, BfvParametersBuilder, Ciphertext, Encoding, Plaintext, PublicKey,
+    RelinearizationKey, SecretKey,
 };
-use fhe_traits::{Deserialize, FheDecoder, FheDecrypter, FheEncoder as _, FheEncrypter, Serialize};
+use fhe::mbfv::{
+    Aggregate as _, AggregateIter as _, CommonRandomPoly, DecryptionShare, PublicKeyShare,
+};
+use fhe_traits::{
+    Deserialize, DeserializeParametrized, FheDecoder, FheDecrypter, FheEncoder as _, FheEncrypter,
+    Serialize,
+};
 use num_bigint::BigUint;
 use rand::rng;
 use std::{error::Error, sync::Arc};
@@ -221,6 +227,178 @@ fn t_2_64_multiplication_gpu_sized() -> Result<(), Box<dyn Error>> {
 
     let out = Vec::<u64>::try_decode(&sk.try_decrypt(&ct_res)?, Encoding::poly())?;
     assert_eq!(out[0], a.wrapping_mul(b));
+    Ok(())
+}
+
+#[test]
+fn t_2_64_public_key_encryption() -> Result<(), Box<dyn Error>> {
+    let mut rng = rng();
+    let params = parameters_2_64(&[60, 60, 60]);
+    let sk = SecretKey::random(&params, &mut rng);
+    let pk = PublicKey::new(&sk, &mut rng);
+
+    let mut values = vec![0u64; params.degree()];
+    values[0] = u64::MAX;
+    values[1] = 0xDEAD_BEEF_1234_5678;
+
+    let pt = Plaintext::try_encode(values.as_slice(), Encoding::poly(), &params)?;
+    let ct: Ciphertext = pk.try_encrypt(&pt, &mut rng)?;
+    let out = Vec::<u64>::try_decode(&sk.try_decrypt(&ct)?, Encoding::poly())?;
+    assert_eq!(out, values);
+    Ok(())
+}
+
+#[test]
+fn t_2_64_sub_and_neg_wrap_like_u64() -> Result<(), Box<dyn Error>> {
+    let mut rng = rng();
+    let params = parameters_2_64(&[60, 60, 60]);
+    let sk = SecretKey::random(&params, &mut rng);
+
+    let a = 3u64;
+    let b = 10u64;
+
+    let mut v1 = vec![0u64; params.degree()];
+    v1[0] = a;
+    let mut v2 = vec![0u64; params.degree()];
+    v2[0] = b;
+
+    let pt1 = Plaintext::try_encode(v1.as_slice(), Encoding::poly(), &params)?;
+    let pt2 = Plaintext::try_encode(v2.as_slice(), Encoding::poly(), &params)?;
+    let ct1: Ciphertext = sk.try_encrypt(&pt1, &mut rng)?;
+    let ct2: Ciphertext = sk.try_encrypt(&pt2, &mut rng)?;
+
+    // 3 - 10 wraps to 2^64 - 7, just like u64 wrapping_sub.
+    let out = Vec::<u64>::try_decode(&sk.try_decrypt(&(&ct1 - &ct2))?, Encoding::poly())?;
+    assert_eq!(out[0], a.wrapping_sub(b));
+
+    // -3 wraps to 2^64 - 3.
+    let out = Vec::<u64>::try_decode(&sk.try_decrypt(&(-&ct1))?, Encoding::poly())?;
+    assert_eq!(out[0], a.wrapping_neg());
+    Ok(())
+}
+
+#[test]
+fn t_2_64_i64_centered_decode() -> Result<(), Box<dyn Error>> {
+    let mut rng = rng();
+    let params = parameters_2_64(&[60, 60, 60]);
+    let sk = SecretKey::random(&params, &mut rng);
+
+    // Values above t/2 decode as negative: the full i64 range is addressable.
+    let mut values = vec![0u64; params.degree()];
+    values[0] = u64::MAX; // -1
+    values[1] = 5; // 5
+    values[2] = 1u64 << 63; // i64::MIN
+
+    let pt = Plaintext::try_encode(values.as_slice(), Encoding::poly(), &params)?;
+    let ct: Ciphertext = sk.try_encrypt(&pt, &mut rng)?;
+    let out = Vec::<i64>::try_decode(&sk.try_decrypt(&ct)?, Encoding::poly())?;
+    assert_eq!(out[0], -1);
+    assert_eq!(out[1], 5);
+    assert_eq!(out[2], i64::MIN);
+    Ok(())
+}
+
+#[test]
+fn t_64bit_prime_input_reduced_mod_t() -> Result<(), Box<dyn Error>> {
+    let mut rng = rng();
+    // t = 2^64 - 59: inputs in [t, 2^64) must come back reduced modulo t
+    // after an encryption round trip.
+    let t = BigUint::from(u64::MAX - 58);
+    let params = BfvParametersBuilder::new()
+        .set_degree(16)
+        .set_plaintext_modulus_biguint(t.clone())
+        .set_moduli_sizes(&[60, 60, 60])
+        .build_arc()?;
+    let sk = SecretKey::random(&params, &mut rng);
+
+    let mut values = vec![BigUint::from(0u32); params.degree()];
+    values[0] = BigUint::from(u64::MAX); // t + 58 -> 58
+
+    let pt = Plaintext::try_encode(values.as_slice(), Encoding::poly(), &params)?;
+    let ct: Ciphertext = sk.try_encrypt(&pt, &mut rng)?;
+    let out = Vec::<BigUint>::try_decode(&sk.try_decrypt(&ct)?, Encoding::poly())?;
+    assert_eq!(out[0], BigUint::from(58u32));
+    Ok(())
+}
+
+#[test]
+fn t_2_64_encryption_at_deeper_levels() -> Result<(), Box<dyn Error>> {
+    // Each level has its own delta = floor(q_level / t) polynomial; exercise
+    // the levels where q_level still exceeds t (levels 0 and 1: 180 and 120
+    // bits of ciphertext modulus against a 64-bit t).
+    let mut rng = rng();
+    let params = parameters_2_64(&[60, 60, 60]);
+    let sk = SecretKey::random(&params, &mut rng);
+
+    let mut values = vec![0u64; params.degree()];
+    values[0] = u64::MAX;
+    values[1] = 0x0123_4567_89AB_CDEF;
+
+    for level in 0..=1 {
+        let pt = Plaintext::try_encode(values.as_slice(), Encoding::poly_at_level(level), &params)?;
+        let ct: Ciphertext = sk.try_encrypt(&pt, &mut rng)?;
+        let out = Vec::<u64>::try_decode(&sk.try_decrypt(&ct)?, Encoding::poly_at_level(level))?;
+        assert_eq!(out, values, "level {level}");
+    }
+
+    // At level 2 only 60 bits of ciphertext modulus remain, so q < t and
+    // delta = 0: encoding must fail loudly instead of decrypting to garbage.
+    let result = Plaintext::try_encode(values.as_slice(), Encoding::poly_at_level(2), &params);
+    assert!(matches!(
+        result,
+        Err(fhe::Error::EncodingNotSupported { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn t_2_64_ciphertext_serialization_roundtrip() -> Result<(), Box<dyn Error>> {
+    let mut rng = rng();
+    let params = parameters_2_64(&[60, 60, 60]);
+    let sk = SecretKey::random(&params, &mut rng);
+
+    let mut values = vec![0u64; params.degree()];
+    values[0] = u64::MAX;
+
+    let pt = Plaintext::try_encode(values.as_slice(), Encoding::poly(), &params)?;
+    let ct: Ciphertext = sk.try_encrypt(&pt, &mut rng)?;
+    let ct2 = Ciphertext::from_bytes(&ct.to_bytes(), &params)?;
+    let out = Vec::<u64>::try_decode(&sk.try_decrypt(&ct2)?, Encoding::poly())?;
+    assert_eq!(out, values);
+    Ok(())
+}
+
+#[test]
+fn t_2_64_multiparty_decryption() -> Result<(), Box<dyn Error>> {
+    let mut rng = rng();
+    let params = parameters_2_64(&[60, 60, 60]);
+    let crp = CommonRandomPoly::new(&params, &mut rng)?;
+
+    // Three parties collectively generate a public key.
+    let sk_shares: Vec<SecretKey> = (0..3)
+        .map(|_| SecretKey::random(&params, &mut rng))
+        .collect();
+    let pk: PublicKey = sk_shares
+        .iter()
+        .map(|sk| PublicKeyShare::new(sk, crp.clone(), &mut rng))
+        .aggregate()?;
+
+    let mut values = vec![0u64; params.degree()];
+    values[0] = u64::MAX;
+    values[1] = 0xDEAD_BEEF_1234_5678;
+
+    let pt = Plaintext::try_encode(values.as_slice(), Encoding::poly(), &params)?;
+    let ct = Arc::new(pk.try_encrypt(&pt, &mut rng)?);
+
+    // Collective decryption through aggregated decryption shares.
+    let decrypted = Plaintext::from_shares(
+        sk_shares
+            .iter()
+            .map(|sk| DecryptionShare::new(sk, &ct, &mut rng))
+            .collect::<fhe::Result<Vec<_>>>()?,
+    )?;
+    let out = Vec::<u64>::try_decode(&decrypted, Encoding::poly())?;
+    assert_eq!(out, values);
     Ok(())
 }
 
