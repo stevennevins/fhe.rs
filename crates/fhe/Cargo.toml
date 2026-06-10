@@ -60,6 +60,10 @@ harness = false
 name = "bfv_rgsw"
 harness = false
 
+[[bench]]
+name = "hotpaths"
+harness = false
+
 [[example]]
 name = "bfv_basic"
 
