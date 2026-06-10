@@ -159,7 +159,7 @@ const fn pow_mod(mut base: u64, mut exp: u64, p: u64) -> u64 {
 
 /// Inverse modulo a prime p, via Fermat's little theorem.
 fn inv_mod(a: u64, p: u64) -> Option<u64> {
-    if a % p == 0 {
+    if a.is_multiple_of(p) {
         None
     } else {
         Some(pow_mod(a, p - 2, p))
@@ -219,9 +219,7 @@ mod tests {
         for size in [8, 32, 1024] {
             let op = Ntt64Operator::new(GOLDILOCKS, size).unwrap();
             for _ in 0..10 {
-                let a: Vec<u64> = (0..size)
-                    .map(|_| rng.random_range(0..GOLDILOCKS))
-                    .collect();
+                let a: Vec<u64> = (0..size).map(|_| rng.random_range(0..GOLDILOCKS)).collect();
 
                 let mut b = a.clone();
                 op.forward(&mut b);

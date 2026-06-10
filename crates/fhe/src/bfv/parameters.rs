@@ -539,8 +539,9 @@ impl BfvParametersBuilder {
 
         // Create NTT operator for SIMD operations if possible
         let ntt_operator = match &plaintext_modulus_struct {
-            PlaintextModulus::Small { modulus, .. } => NttOperator::new(modulus, self.degree)
-                .map(|op| PlaintextNtt::Small(Arc::new(op))),
+            PlaintextModulus::Small { modulus, .. } => {
+                NttOperator::new(modulus, self.degree).map(|op| PlaintextNtt::Small(Arc::new(op)))
+            }
             // NTT-friendly primes of 62 to 64 bits (e.g. Goldilocks) get SIMD
             // through the u128-based operator. Moduli above 2^64 or without an
             // NTT of this size (e.g. t = 2^64) stay None and reject SIMD.
