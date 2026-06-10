@@ -145,6 +145,17 @@ impl Freezable {
                 "account {caller} is not the freezer"
             )));
         }
+        Ok(self.store_frozen(token, account, amount))
+    }
+
+    /// Stores `amount` as `account`'s frozen ciphertext (no role check;
+    /// the public entry point is [`Self::set_confidential_frozen`]).
+    pub(crate) fn store_frozen(
+        &mut self,
+        token: &mut ConfidentialToken,
+        account: Account,
+        amount: FheUint64,
+    ) -> Handle {
         let handle = token.store_ciphertext(amount);
         token
             .acl
@@ -152,7 +163,12 @@ impl Freezable {
             .or_default()
             .extend([account, self.freezer]);
         self.frozen.insert(account, handle);
-        Ok(handle)
+        handle
+    }
+
+    /// Drops `account`'s frozen entry (back to an implicit zero).
+    pub(crate) fn clear_frozen(&mut self, account: Account) {
+        self.frozen.remove(&account);
     }
 
     /// `account`'s current frozen-amount handle, if one was ever set.
@@ -266,7 +282,7 @@ impl Freezable {
 
     /// `account`'s frozen ciphertext, or a fresh encryption of zero if
     /// none was ever set.
-    fn frozen_ct<R: RngCore + CryptoRng>(
+    pub(crate) fn frozen_ct<R: RngCore + CryptoRng>(
         &self,
         token: &ConfidentialToken,
         account: Account,

@@ -7,6 +7,7 @@ use fhe::token::extensions::freezable::Freezable;
 use fhe::token::extensions::identity::{IdentityCheck, IdentityRegistry, InMemoryIdentityRegistry};
 use fhe::token::extensions::observer::Observers;
 use fhe::token::extensions::restricted::{Restriction, RestrictionMode, Restrictions};
+use fhe::token::extensions::rwa::Rwa;
 use fhe::token::extensions::wrapper::PublicLedger;
 use fhe::token::{Account, ConfidentialToken};
 use fhe::typed::{FheUint64, set_server_key};
@@ -560,4 +561,196 @@ fn wrap_beyond_public_balance_errs() {
     assert_eq!(token.handles().len(), handles_before);
     assert_eq!(ledger.balance(ALICE), 100);
     assert_eq!(ledger.total(), 100);
+}
+
+const AGENT: Account = 8;
+
+/// Pause: transfers Err while paused and succeed after unpause; a
+/// non-agent cannot pause.
+#[test]
+fn rwa_pause_blocks_transfers_publicly() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut rwa = Rwa::new(AGENT);
+    token.mint(ALICE, 100, &mut rng).unwrap();
+
+    assert!(rwa.pause(ALICE).is_err());
+    assert!(!rwa.is_paused());
+    rwa.pause(AGENT).unwrap();
+    assert!(rwa.is_paused());
+
+    let amount = token.committee().encrypt(10, &mut rng).unwrap();
+    let handles_before = token.handles().len();
+    assert!(
+        rwa.transfer(&mut token, ALICE, BOB, &amount, &mut rng)
+            .is_err()
+    );
+    assert_eq!(token.handles().len(), handles_before);
+
+    rwa.unpause(AGENT).unwrap();
+    rwa.transfer(&mut token, ALICE, BOB, &amount, &mut rng)
+        .unwrap();
+    assert_eq!(balance_of(&token, BOB), 10);
+}
+
+/// Force transfer: succeeds from a blocked, frozen sender while paused —
+/// but still cannot overdraw: forcing more than the balance silently
+/// zeroes.
+#[test]
+fn rwa_force_transfer_bypasses_policy_but_not_balance() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut rwa = Rwa::new(AGENT);
+    token.mint(ALICE, 100, &mut rng).unwrap();
+
+    // Alice is blocked, fully frozen, and the token is paused.
+    rwa.block_user(AGENT, ALICE).unwrap();
+    let frozen = token.committee().encrypt(100, &mut rng).unwrap();
+    rwa.set_confidential_frozen(&mut token, AGENT, ALICE, frozen)
+        .unwrap();
+    rwa.pause(AGENT).unwrap();
+
+    let amount = token.committee().encrypt(60, &mut rng).unwrap();
+    // The policy transfer is blocked threefold...
+    assert!(
+        rwa.transfer(&mut token, ALICE, BOB, &amount, &mut rng)
+            .is_err()
+    );
+    // ...but the agent's force transfer goes through.
+    let moved = rwa
+        .force_transfer(&mut token, AGENT, ALICE, BOB, &amount, &mut rng)
+        .unwrap();
+    assert_eq!(token.decrypt_for(moved, ALICE, &mut rng).unwrap(), 60);
+    assert_eq!(balance_of(&token, ALICE), 40);
+    assert_eq!(balance_of(&token, BOB), 60);
+
+    // The balance guard stays: forcing 41 from the remaining 40 silently
+    // zeroes (never-revert semantics, not an error).
+    let amount = token.committee().encrypt(41, &mut rng).unwrap();
+    let zeroed = rwa
+        .force_transfer(&mut token, AGENT, ALICE, BOB, &amount, &mut rng)
+        .unwrap();
+    assert_eq!(token.decrypt_for(zeroed, ALICE, &mut rng).unwrap(), 0);
+    assert_eq!(balance_of(&token, ALICE), 40);
+    assert_eq!(balance_of(&token, BOB), 60);
+}
+
+/// Recover: a wallet with balance 1000 of which 400 frozen recovers to a
+/// new wallet holding balance 1000 with 400 still frozen — and the
+/// frozen amount is never threshold-decrypted during recovery (asserted
+/// over the audit log: only the blinded min comparison and masked
+/// refreshes).
+#[test]
+fn rwa_recover_carries_frozen_amount_encrypted() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut rwa = Rwa::new(AGENT);
+    const LOST: Account = 7;
+    const NEW_WALLET: Account = 17;
+    token.mint(LOST, 1000, &mut rng).unwrap();
+    let frozen = token.committee().encrypt(400, &mut rng).unwrap();
+    rwa.set_confidential_frozen(&mut token, AGENT, LOST, frozen)
+        .unwrap();
+
+    rwa.recover(&mut token, AGENT, LOST, NEW_WALLET, &mut rng)
+        .unwrap();
+
+    // The full balance moved, frozen portion included.
+    assert_eq!(balance_of(&token, LOST), 0);
+    assert_eq!(balance_of(&token, NEW_WALLET), 1000);
+    // The recovered wallet has 400 still frozen: 601 exceeds the
+    // available 600 and silently zeroes, 600 succeeds.
+    let frozen_handle = rwa.freezable().confidential_frozen(NEW_WALLET).unwrap();
+    assert_eq!(
+        token
+            .decrypt_for(frozen_handle, NEW_WALLET, &mut rng)
+            .unwrap(),
+        400
+    );
+    assert_eq!(rwa.freezable().confidential_frozen(LOST), None);
+
+    // The recovery's committee view: ONE blinded comparison (the
+    // encrypted min) and masked refreshes — no decrypt of the frozen
+    // value anywhere in the transcript.
+    assert_eq!(rwa.recover_audits().len(), 1);
+    let audit = &rwa.recover_audits()[0];
+    assert_ne!(audit.min_compare.revealed, 400, "frozen value leaked");
+    assert_ne!(audit.min_compare.revealed, 1000, "balance leaked");
+    assert_ne!(
+        audit.min_compare.revealed,
+        1000 - 400,
+        "true difference leaked"
+    );
+    for blind in &audit.min_compare.blinds {
+        assert!(*blind >= 3);
+        assert_ne!(audit.min_compare.revealed / blind, 1000 - 400);
+    }
+    assert_eq!(audit.refreshes.len(), 2);
+    for refresh in &audit.refreshes {
+        for mask in &refresh.masks {
+            let view = refresh.revealed.wrapping_sub(*mask);
+            assert_ne!(view, 400, "frozen value visible to a single party");
+            assert_ne!(view, 1000, "balance visible to a single party");
+        }
+    }
+}
+
+/// Recover saturates: a frozen amount above the balance carries only the
+/// balance (encrypted min), so the recovered wallet is fully frozen but
+/// never over-frozen relative to what actually moved.
+#[test]
+fn rwa_recover_saturates_overfrozen_wallet() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut rwa = Rwa::new(AGENT);
+    const LOST: Account = 7;
+    const NEW_WALLET: Account = 17;
+    token.mint(LOST, 300, &mut rng).unwrap();
+    let frozen = token.committee().encrypt(900, &mut rng).unwrap();
+    rwa.set_confidential_frozen(&mut token, AGENT, LOST, frozen)
+        .unwrap();
+
+    rwa.recover(&mut token, AGENT, LOST, NEW_WALLET, &mut rng)
+        .unwrap();
+    assert_eq!(balance_of(&token, NEW_WALLET), 300);
+    let frozen_handle = rwa.freezable().confidential_frozen(NEW_WALLET).unwrap();
+    assert_eq!(
+        token
+            .decrypt_for(frozen_handle, NEW_WALLET, &mut rng)
+            .unwrap(),
+        300
+    );
+}
+
+/// Role enforcement: every agent-gated entry point Errs for non-agents.
+#[test]
+fn rwa_agent_gates_every_entry_point() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut rwa = Rwa::new(AGENT);
+    token.mint(ALICE, 100, &mut rng).unwrap();
+    assert!(rwa.is_agent(AGENT));
+    assert!(!rwa.is_agent(ALICE));
+
+    let amount = token.committee().encrypt(10, &mut rng).unwrap();
+    assert!(rwa.pause(ALICE).is_err());
+    assert!(rwa.unpause(ALICE).is_err());
+    assert!(rwa.block_user(ALICE, BOB).is_err());
+    assert!(rwa.unblock_user(ALICE, BOB).is_err());
+    let frozen = token.committee().encrypt(10, &mut rng).unwrap();
+    assert!(
+        rwa.set_confidential_frozen(&mut token, ALICE, ALICE, frozen)
+            .is_err()
+    );
+    assert!(
+        rwa.force_transfer(&mut token, ALICE, ALICE, BOB, &amount, &mut rng)
+            .is_err()
+    );
+    assert!(
+        rwa.recover(&mut token, ALICE, ALICE, BOB, &mut rng)
+            .is_err()
+    );
+    // None of the rejections did encrypted work or touched state.
+    assert_eq!(balance_of(&token, ALICE), 100);
+    assert!(!rwa.is_paused());
 }
