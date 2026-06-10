@@ -49,6 +49,8 @@
 //! supply is intentionally not ACL'd: mint amounts are public, so the
 //! supply is public information already.
 
+pub mod extensions;
+
 use std::collections::{HashMap, HashSet};
 
 use rand::{CryptoRng, RngCore};
