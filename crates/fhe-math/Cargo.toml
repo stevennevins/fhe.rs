@@ -16,8 +16,11 @@ bench = false  # Disable default bench (we use criterion)
 
 [features]
 tfhe-ntt = []
+cuda = ["dep:cudarc", "dep:log"]
 
 [dependencies]
+cudarc = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
 fhe-traits = { version = "=0.1.1", path = "../fhe-traits" }
 fhe-util = { version = "=0.1.1", path = "../fhe-util" }
 

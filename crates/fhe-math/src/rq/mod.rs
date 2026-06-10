@@ -292,6 +292,14 @@ impl<R: RepresentationTag> Poly<R> {
 
     /// Computes the forward Ntt on the coefficients
     fn ntt_forward(&mut self) {
+        // The GPU produces bit-exact results and falls back to the CPU path
+        // below when unavailable or when the operation is too small to win.
+        #[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+        if let Some(slice) = self.coefficients.as_slice_mut()
+            && crate::cuda::ntt_forward(&self.ctx, slice)
+        {
+            return;
+        }
         if self.allow_variable_time_computations {
             izip!(self.coefficients.outer_iter_mut(), self.ctx.ops.iter())
                 .for_each(|(mut v, op)| unsafe { op.forward_vt(v.as_mut_ptr()) });
@@ -303,6 +311,13 @@ impl<R: RepresentationTag> Poly<R> {
 
     /// Computes the backward Ntt on the coefficients
     fn ntt_backward(&mut self) {
+        // See ntt_forward for the GPU dispatch rationale.
+        #[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+        if let Some(slice) = self.coefficients.as_slice_mut()
+            && crate::cuda::ntt_backward(&self.ctx, slice)
+        {
+            return;
+        }
         if self.allow_variable_time_computations {
             izip!(self.coefficients.outer_iter_mut(), self.ctx.ops.iter())
                 .for_each(|(mut v, op)| unsafe { op.backward_vt(v.as_mut_ptr()) });
@@ -551,6 +566,31 @@ impl Poly<Ntt> {
     pub fn into_ntt_shoup(mut self) -> Poly<NttShoup> {
         self.compute_coefficients_shoup();
         Poly::from_parts(self)
+    }
+}
+
+#[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+impl Poly<Ntt> {
+    /// Builds a polynomial from GPU-computed coefficients (CUDA backend).
+    /// The result is marked variable-time, matching the CPU key-switch path
+    /// it replaces.
+    pub(crate) fn from_gpu_coefficients(ctx: &Arc<Context>, coefficients: Array2<u64>) -> Self {
+        Self {
+            ctx: ctx.clone(),
+            has_lazy_coefficients: false,
+            allow_variable_time_computations: true,
+            coefficients,
+            coefficients_shoup: None,
+            _repr: PhantomData,
+        }
+    }
+}
+
+impl Poly<NttShoup> {
+    #[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+    /// The Shoup representation of the coefficients (CUDA backend).
+    pub(crate) fn coefficients_shoup(&self) -> Option<ArrayView2<'_, u64>> {
+        self.coefficients_shoup.as_ref().map(|c| c.view())
     }
 }
 

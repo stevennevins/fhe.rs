@@ -314,6 +314,20 @@ impl NttOperator {
         debug_assert!(*y < self.p_twice);
     }
 
+    /// Accessors for the precomputed tables, used by the CUDA backend to
+    /// upload the exact same twiddle factors as the CPU implementation.
+    #[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+    pub(crate) fn cuda_tables(&self) -> crate::cuda::NttTables<'_> {
+        crate::cuda::NttTables {
+            omegas: &self.omegas,
+            omegas_shoup: &self.omegas_shoup,
+            zetas_inv: &self.zetas_inv,
+            zetas_inv_shoup: &self.zetas_inv_shoup,
+            size_inv: self.size_inv,
+            size_inv_shoup: self.size_inv_shoup,
+        }
+    }
+
     /// Returns a 2n-th primitive root modulo p.
     ///
     /// Aborts if p is not prime or n is not a power of 2 that is >= 8.
