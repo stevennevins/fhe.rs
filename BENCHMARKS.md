@@ -194,12 +194,20 @@ cargo run --release -p fhe --example confidential_transfer_timing               
 cargo run --release -p fhe --example confidential_transfer_timing --features cuda  # GPU
 ```
 
+A freezable (double-guard) transfer — the `ERC7984Freezable`-style
+extension — adds one more interactive comparison and one select for the
+available amount (`select(balance >= frozen, balance - frozen, 0)`) on
+top of the core transfer circuit.
+
 | Op | CPU | CUDA |
 |---|---|---|
 | committee keygen (N = 3) | 0.51 s | 0.31 s |
 | one confidential transfer | 1.14 s | 0.32 s |
+| one freezable (double-guard) transfer | 1.41 s | 0.56 s |
 
 The CUDA speedup (3.5×) comes almost entirely from the five
 relinearized multiplications inside the transfer; the committee
 round-trips (decryption shares, mask encryptions) are CPU-side and
-dominate the remaining 0.3 s.
+dominate the remaining 0.3 s. The freezable transfer's extra comparison
+is one of those CPU-side round-trips, which is why its overhead
+(~0.25 s) is similar on both backends.
