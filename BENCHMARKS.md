@@ -183,9 +183,9 @@ Wall-clock cost of the `fhe::token` confidential transfer at the curated
 128-bit `FheUint64` parameters (degree 16384, six moduli, 291-bit q),
 with an in-process 3-party committee. One transfer performs one
 interactive balance-guard comparison (blinded-difference threshold
-decryption), three homomorphic multiplications (two cmux balance
-updates and the transferred-amount select), and two gateway refreshes
-of the touched balances.
+decryption), five relinearized multiplications (two two-multiply cmux
+balance updates and the transferred-amount select), and two gateway
+refreshes of the touched balances.
 
 Reproduce with:
 
