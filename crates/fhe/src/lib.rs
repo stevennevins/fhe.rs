@@ -5,6 +5,7 @@
 mod errors;
 
 pub mod bfv;
+pub mod gateway;
 pub mod mbfv;
 pub mod proto;
 pub mod typed;

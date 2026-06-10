@@ -188,7 +188,7 @@ fn with_server_key<T>(f: impl FnOnce(&ServerKey) -> T) -> T {
 /// the [module documentation](self) for an example.
 #[derive(Clone)]
 pub struct FheUint64 {
-    ct: Ciphertext,
+    pub(crate) ct: Ciphertext,
 }
 
 /// t = 2^64 as a `BigUint`.
@@ -199,7 +199,7 @@ fn t_2_64() -> BigUint {
 /// Encodes `value` into coefficient 0 of a degree-n plaintext polynomial.
 /// With both operands encoded this way, polynomial multiplication leaves the
 /// product in coefficient 0.
-fn encode(value: u64, par: &Arc<BfvParameters>) -> Result<Plaintext> {
+pub(crate) fn encode(value: u64, par: &Arc<BfvParameters>) -> Result<Plaintext> {
     let mut v = vec![0u64; par.degree()];
     if let Some(first) = v.first_mut() {
         *first = value;
@@ -207,7 +207,7 @@ fn encode(value: u64, par: &Arc<BfvParameters>) -> Result<Plaintext> {
     Plaintext::try_encode(v.as_slice(), Encoding::poly(), par)
 }
 
-fn check_parameters(par: &Arc<BfvParameters>) -> Result<()> {
+pub(crate) fn check_parameters(par: &Arc<BfvParameters>) -> Result<()> {
     if *par.plaintext_big() != t_2_64() {
         return Err(Error::DefaultError(
             "FheUint64 requires parameters with plaintext modulus t = 2^64".to_string(),
