@@ -15,4 +15,5 @@
 //! [`ConfidentialToken`]: crate::token::ConfidentialToken
 
 pub mod identity;
+pub mod observer;
 pub mod restricted;

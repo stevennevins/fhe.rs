@@ -4,6 +4,7 @@
 
 use fhe::gateway::Committee;
 use fhe::token::extensions::identity::{IdentityCheck, IdentityRegistry, InMemoryIdentityRegistry};
+use fhe::token::extensions::observer::Observers;
 use fhe::token::extensions::restricted::{Restriction, RestrictionMode, Restrictions};
 use fhe::token::{Account, ConfidentialToken};
 use fhe::typed::{FheUint64, set_server_key};
@@ -11,6 +12,7 @@ use rand::rng;
 
 const ALICE: Account = 1;
 const BOB: Account = 2;
+const EVE: Account = 4;
 
 fn toy_token() -> ConfidentialToken {
     let mut rng = rng();
@@ -126,4 +128,89 @@ fn identity_check_gates_recipient_on_transfer_and_mint() {
     check.mint(&mut token, BOB, 5, &mut rng).unwrap();
     assert_eq!(balance_of(&token, ALICE), 90);
     assert_eq!(balance_of(&token, BOB), 15);
+}
+
+/// After set_observer(alice, eve), a transfer's new sender balance
+/// handle AND transferred-amount handle are allowed to eve and decrypt
+/// for her; handles created BEFORE the observer was set stay denied.
+#[test]
+fn observer_sees_new_handles_but_not_old_ones() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let observers = {
+        let mut o = Observers::new();
+        token.mint(ALICE, 100, &mut rng).unwrap();
+        o.set_observer(ALICE, EVE);
+        assert_eq!(o.observer(ALICE), Some(EVE));
+        o
+    };
+    let pre_observer_balance = token.balance_handle(ALICE).unwrap();
+
+    let amount = token.committee().encrypt(10, &mut rng).unwrap();
+    let amount_handle = observers
+        .transfer(&mut token, ALICE, BOB, &amount, &mut rng)
+        .unwrap();
+    let new_balance = token.balance_handle(ALICE).unwrap();
+
+    assert!(token.is_allowed(new_balance, EVE));
+    assert!(token.is_allowed(amount_handle, EVE));
+    assert_eq!(token.decrypt_for(new_balance, EVE, &mut rng).unwrap(), 90);
+    assert_eq!(token.decrypt_for(amount_handle, EVE, &mut rng).unwrap(), 10);
+    // The balance handle from before the observer was set stays denied.
+    assert!(!token.is_allowed(pre_observer_balance, EVE));
+    assert!(
+        token
+            .decrypt_for(pre_observer_balance, EVE, &mut rng)
+            .is_err()
+    );
+}
+
+/// Removing the observer stops future grants but does not revoke past
+/// ones — the documented OZ no-revocation semantics, pinned.
+#[test]
+fn removing_observer_stops_future_grants_keeps_past_ones() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut observers = Observers::new();
+    observers.set_observer(ALICE, EVE);
+    // Mint grants too: the new balance handle is observed.
+    let observed_balance = observers.mint(&mut token, ALICE, 100, &mut rng).unwrap();
+    assert!(token.is_allowed(observed_balance, EVE));
+
+    observers.remove_observer(ALICE);
+    assert_eq!(observers.observer(ALICE), None);
+
+    let amount = token.committee().encrypt(10, &mut rng).unwrap();
+    let amount_handle = observers
+        .transfer(&mut token, ALICE, BOB, &amount, &mut rng)
+        .unwrap();
+    // New handles after removal: denied to eve.
+    assert!(!token.is_allowed(token.balance_handle(ALICE).unwrap(), EVE));
+    assert!(!token.is_allowed(amount_handle, EVE));
+    // Previously granted handle still decrypts (no revocation).
+    assert_eq!(
+        token.decrypt_for(observed_balance, EVE, &mut rng).unwrap(),
+        100
+    );
+}
+
+/// An observer on the RECIPIENT side sees the recipient's rotated
+/// balance and the transferred amount, but not the sender's balance.
+#[test]
+fn recipient_observer_sees_recipient_activity_only() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    token.mint(ALICE, 100, &mut rng).unwrap();
+    let mut observers = Observers::new();
+    observers.set_observer(BOB, EVE);
+
+    let amount = token.committee().encrypt(30, &mut rng).unwrap();
+    let amount_handle = observers
+        .transfer(&mut token, ALICE, BOB, &amount, &mut rng)
+        .unwrap();
+
+    let bob_balance = token.balance_handle(BOB).unwrap();
+    assert_eq!(token.decrypt_for(bob_balance, EVE, &mut rng).unwrap(), 30);
+    assert_eq!(token.decrypt_for(amount_handle, EVE, &mut rng).unwrap(), 30);
+    assert!(!token.is_allowed(token.balance_handle(ALICE).unwrap(), EVE));
 }
