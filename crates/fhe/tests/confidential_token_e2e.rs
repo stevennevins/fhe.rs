@@ -12,10 +12,11 @@
 use std::collections::HashMap;
 
 use fhe::gateway::Committee;
+use fhe::mbfv::Aggregate;
 use fhe::token::{Account, ConfidentialToken, RefreshPolicy};
-use fhe::typed::safe_math::{try_add, try_sub};
+use fhe::typed::safe_math::{MAX_SAFE_VALUE, select, try_add, try_sub};
 use fhe::typed::{FheUint64, ServerKey, set_server_key};
-use fhe_traits::{DeserializeParametrized, Serialize};
+use fhe_traits::{DeserializeParametrized, FheDecoder, Serialize};
 use rand::rng;
 use rand::rngs::ThreadRng;
 
@@ -247,6 +248,40 @@ fn confidential_token_e2e() {
     let (ok, diff) = try_sub(committee, &b, &a, &mut rng).unwrap();
     assert_eq!(committee.threshold_decrypt(&ok, &mut rng).unwrap(), 0);
     assert_eq!(committee.threshold_decrypt(&diff, &mut rng).unwrap(), 400);
+
+    // The remaining gateway services, exercised directly at production
+    // parameters: public-key encryption, an explicit refresh, both
+    // comparison entry points, the raw select mux, and the
+    // single-share-cannot-decrypt property.
+    assert!(committee.blind_bits() >= 2);
+    let value = FheUint64::encrypt_with_public_key(4242, committee.public_key(), &mut rng).unwrap();
+    let refreshed = committee.refresh(&value, &mut rng).unwrap();
+    assert_eq!(
+        committee.threshold_decrypt(&refreshed, &mut rng).unwrap(),
+        4242
+    );
+
+    let big = committee.encrypt(MAX_SAFE_VALUE, &mut rng).unwrap();
+    let ge = committee.compare_ge(&big, &value, &mut rng).unwrap();
+    assert_eq!(committee.threshold_decrypt(&ge, &mut rng).unwrap(), 1);
+    let (lt, transcript) = committee
+        .compare_ge_with_transcript(&value, &big, &mut rng)
+        .unwrap();
+    assert_eq!(committee.threshold_decrypt(&lt, &mut rng).unwrap(), 0);
+    assert_eq!(transcript.blinds.len(), 3);
+    assert_ne!(transcript.revealed, 4242u64.wrapping_sub(MAX_SAFE_VALUE));
+
+    let chosen = select(&ge, &value, &big);
+    assert_eq!(
+        committee.threshold_decrypt(&chosen, &mut rng).unwrap(),
+        4242
+    );
+
+    let inner = std::sync::Arc::new(refreshed.into_ciphertext());
+    let lone_share = committee.decryption_share(0, &inner, &mut rng).unwrap();
+    let lone = fhe::bfv::Plaintext::from_shares([lone_share]).unwrap();
+    let decoded = Vec::<u64>::try_decode(&lone, fhe::bfv::Encoding::poly()).unwrap();
+    assert_ne!(decoded[0], 4242);
 }
 
 /// The no-refresh companion: with refresh disabled, the same alternating

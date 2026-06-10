@@ -176,3 +176,30 @@ small plaintext modulus: a ~2^64 modulus pays extra in the BigUint
 plaintext scaling path. That is the documented noise/scaling cost of
 64-bit t, not typed-layer overhead. Encrypt/decrypt/add are dominated by
 CPU-side encoding and stay near the CPU times.
+
+## Confidential token kit
+
+Wall-clock cost of the `fhe::token` confidential transfer at the curated
+128-bit `FheUint64` parameters (degree 16384, six moduli, 291-bit q),
+with an in-process 3-party committee. One transfer performs one
+interactive balance-guard comparison (blinded-difference threshold
+decryption), three homomorphic multiplications (two cmux balance
+updates and the transferred-amount select), and two gateway refreshes
+of the touched balances.
+
+Reproduce with:
+
+```bash
+cargo run --release -p fhe --example confidential_transfer_timing                  # CPU
+cargo run --release -p fhe --example confidential_transfer_timing --features cuda  # GPU
+```
+
+| Op | CPU | CUDA |
+|---|---|---|
+| committee keygen (N = 3) | 0.51 s | 0.31 s |
+| one confidential transfer | 1.14 s | 0.32 s |
+
+The CUDA speedup (3.5×) comes almost entirely from the five
+relinearized multiplications inside the transfer; the committee
+round-trips (decryption shares, mask encryptions) are CPU-side and
+dominate the remaining 0.3 s.
