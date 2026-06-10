@@ -196,7 +196,8 @@ async fn transfer_by_transaction_rotates_handles_and_hides_insufficiency() {
     assert!(
         as_bob
             .transfer(alice.address, alices_input)
-            .send()
+            .from(bob.address)
+            .call()
             .await
             .is_err()
     );

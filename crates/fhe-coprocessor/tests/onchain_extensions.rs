@@ -153,7 +153,8 @@ async fn extensions_drive_by_transaction() {
     assert!(
         as_alice
             .transfer(bob.address, transfer_1)
-            .send()
+            .from(alice.address)
+            .call()
             .await
             .is_err()
     );
@@ -167,7 +168,8 @@ async fn extensions_drive_by_transaction() {
     assert!(
         as_alice
             .transfer(bob.address, transfer_1)
-            .send()
+            .from(alice.address)
+            .call()
             .await
             .is_err()
     );

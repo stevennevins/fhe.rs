@@ -96,7 +96,8 @@ async fn registered_input_anchors_and_unregistered_inputs_revert() {
     assert!(
         as_agent
             .setConfidentialFrozen(user_address, bogus)
-            .send()
+            .from(agent_address)
+            .call()
             .await
             .is_err()
     );
@@ -105,7 +106,8 @@ async fn registered_input_anchors_and_unregistered_inputs_revert() {
     assert!(
         as_agent
             .setConfidentialFrozen(user_address, handle)
-            .send()
+            .from(agent_address)
+            .call()
             .await
             .is_err()
     );

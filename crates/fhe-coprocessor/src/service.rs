@@ -137,13 +137,14 @@ impl Service {
             }
         }
         loop {
-            while let Some(request) = pending.remove(&next) {
+            if next > target {
+                return Ok(sent);
+            }
+            if let Some(request) = pending.remove(&next) {
                 let fulfillment = self.coprocessor.process(&request)?;
                 sent.push(send_fulfillment(&self.gateway, &fulfillment).await?);
                 next += 1;
-            }
-            if next > target {
-                return Ok(sent);
+                continue;
             }
             let log = live.next().await.ok_or_else(|| {
                 Error::Chain("event subscription ended before the target request".to_string())

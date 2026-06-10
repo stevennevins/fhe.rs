@@ -243,3 +243,32 @@ force transfers run the unmodified core circuit, so their cost is the
 core transfer's; the freezable double guard adds one more interactive
 comparison and select (~0.25 s CPU, backend-independent committee
 traffic, plus ~0.1 s of GPU-side multiplications).
+
+## On-chain gateway: request-tx → fulfillment-tx latency
+
+End-to-end latency of one confidential operation driven through the
+on-chain gateway (`docs/onchain-gateway.md`): from sending the signed
+request transaction on a local anvil devnet to the coprocessor's
+fulfillment transaction receipt — event decode, the FHE circuit, the
+committee traffic, ciphertext export, and both transactions included.
+Curated production parameters (degree 16384, 291-bit q), 3-party
+committee, measured by the e2e harness.
+
+Reproduce with:
+
+```bash
+cargo test -p fhe-coprocessor --test onchain_e2e --release -- --nocapture                  # CPU
+cargo test -p fhe-coprocessor --test onchain_e2e --features cuda --release -- --nocapture  # GPU
+```
+
+| Op | CPU | CUDA |
+|---|---|---|
+| transfer (freezable double guard) | 1.48 s | 0.51 s |
+| transfer, insufficient → silent zero (same circuit by design) | 1.45 s | 0.48 s |
+| force transfer (core circuit) | 1.29 s | 0.42 s |
+
+The chain adds single-digit milliseconds: the latency is the Goal E
+per-extension circuit cost (see the table above) plus two anvil
+transactions and the coprocessor's ciphertext serialization. The silent
+zero row is the point of the never-revert design — it costs the same as
+a successful transfer, on-chain and off.
