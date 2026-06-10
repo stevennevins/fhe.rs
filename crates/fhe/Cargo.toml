@@ -16,6 +16,7 @@ bench = false # Disable default bench (we use criterion)
 
 [features]
 tfhe-ntt = ["fhe-math/tfhe-ntt"]
+cuda = ["fhe-math/cuda"]
 
 [dependencies]
 fhe-math = { version = "=0.2.0", path = "../fhe-math" }
@@ -58,6 +59,10 @@ harness = false
 
 [[bench]]
 name = "bfv_rgsw"
+harness = false
+
+[[bench]]
+name = "hotpaths"
 harness = false
 
 [[example]]

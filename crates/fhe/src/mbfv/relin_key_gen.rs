@@ -352,6 +352,7 @@ impl Aggregate<RelinKeyShare<R2>> for RelinearizationKey {
             ksk_level: 0,
             ctx_ksk: ctx.clone(),
             log_base: 0,
+            cuda_cache: Default::default(),
         };
         Ok(RelinearizationKey { ksk })
     }

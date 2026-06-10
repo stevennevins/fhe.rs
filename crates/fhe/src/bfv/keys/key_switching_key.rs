@@ -42,6 +42,10 @@ pub struct KeySwitchingKey {
 
     // For level with only one modulus, we will use basis
     pub(crate) log_base: usize,
+
+    /// Device-resident copy of the key material (CUDA backend); compares
+    /// equal regardless of upload state and is rebuilt on deserialization.
+    pub(crate) cuda_cache: fhe_math::CudaKskCache,
 }
 
 impl KeySwitchingKey {
@@ -85,6 +89,7 @@ impl KeySwitchingKey {
                 ksk_level,
                 ctx_ksk,
                 log_base,
+                cuda_cache: Default::default(),
             })
         } else {
             let c1 = Self::generate_c1(&ctx_ksk, seed, ctx_ciphertext.moduli().len());
@@ -100,6 +105,7 @@ impl KeySwitchingKey {
                 ksk_level,
                 ctx_ksk,
                 log_base: 0,
+                cuda_cache: Default::default(),
             })
         }
     }
@@ -221,6 +227,16 @@ impl KeySwitchingKey {
                 "The input polynomial does not have the correct context.".to_string(),
             ));
         }
+        // The GPU path runs the whole loop below device-resident with cached
+        // key material; bit-exact with the CPU code, falls back when
+        // unavailable.
+        #[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+        if let Some(res) =
+            fhe_math::__cuda_key_switch(p, &self.c0, &self.c1, &self.ctx_ksk, &self.cuda_cache)
+        {
+            return Ok(res);
+        }
+
         let mut c0 = Poly::<Ntt>::zero(&self.ctx_ksk);
         let mut c1 = Poly::<Ntt>::zero(&self.ctx_ksk);
         let p_coefficients = p.coefficients();
@@ -259,6 +275,17 @@ impl KeySwitchingKey {
                 "The input polynomial does not have the correct context.".to_string(),
             ));
         }
+
+        // See key_switch for the GPU dispatch rationale.
+        #[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+        if let Some((k0, k1)) =
+            fhe_math::__cuda_key_switch(p, &self.c0, &self.c1, &self.ctx_ksk, &self.cuda_cache)
+        {
+            *c0 = k0;
+            *c1 = k1;
+            return Ok(());
+        }
+
         if c0.ctx().as_ref() != self.ctx_ksk.as_ref() {
             *c0 = Poly::<Ntt>::zero(&self.ctx_ksk);
         } else {
@@ -421,6 +448,7 @@ impl BfvTryConvertFrom<&KeySwitchingKeyProto> for KeySwitchingKey {
             ksk_level,
             ctx_ksk,
             log_base: value.log_base as usize,
+            cuda_cache: Default::default(),
         })
     }
 }
