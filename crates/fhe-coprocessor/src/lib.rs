@@ -44,8 +44,11 @@
 pub mod abi;
 pub mod coprocessor;
 pub mod harness;
+pub mod requests;
+pub mod service;
 
 pub use coprocessor::Coprocessor;
+pub use service::Service;
 
 /// Errors of the coprocessor service.
 #[derive(Debug, thiserror::Error)]
