@@ -3,6 +3,8 @@
 
 //! Mathematical utilities for the fhe.rs library.
 
+#[cfg(all(feature = "cuda", not(feature = "tfhe-ntt")))]
+pub(crate) mod cuda;
 mod errors;
 mod proto;
 
