@@ -24,7 +24,16 @@ cargo bench --bench hotpaths --features cuda -- --baseline cpu-main
 # Correctness:
 cargo test --workspace                  # default features (CPU)
 cargo test --workspace --features fhe/cuda,fhe-math/cuda   # differential GPU tests
+
+# Public API unchanged vs main (default features):
+cargo semver-checks --workspace --baseline-rev main
 ```
+
+Gate G5 was re-verified from a clean clone of this branch with the commands
+above: 171 default-feature tests and 231 cuda-feature tests pass, and
+`cargo semver-checks` reports "no semver update required" for all four
+crates. (One pre-existing issue unrelated to this work: the `rgsw` example
+panics identically on `main`, on this branch in CPU mode, and in CUDA mode.)
 
 The benchmark grid lives in `crates/fhe/benches/hotpaths.rs`: forward/inverse
 NTT (all RNS rows of one polynomial), batched forward NTT (64 polynomials),
