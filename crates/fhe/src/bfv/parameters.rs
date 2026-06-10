@@ -132,8 +132,9 @@ impl BfvParameters {
         &self.moduli_sizes
     }
 
-    /// Returns the plaintext modulus if it fits in u64.
-    /// Panics if the modulus is too large.
+    /// Returns the plaintext modulus if it is smaller than 2^62.
+    /// Panics for larger moduli, which are stored as BigUint; use
+    /// [`Self::plaintext_big`] instead.
     #[must_use]
     pub fn plaintext(&self) -> u64 {
         self.plaintext.as_u64().unwrap()
@@ -436,8 +437,11 @@ impl BfvParametersBuilder {
             ));
         }
 
-        let plaintext_modulus_struct = if let Some(p) = self.plaintext.to_u64() {
-            PlaintextModulus::Small {
+        let plaintext_modulus_struct = match self.plaintext.to_u64() {
+            // `Modulus` only supports moduli up to 62 bits; larger values that
+            // still fit in a u64 (62- to 64-bit moduli) take the BigUint path.
+            Some(p) if p >= (1 << 62) => PlaintextModulus::Large(self.plaintext.clone()),
+            Some(p) => PlaintextModulus::Small {
                 modulus: Modulus::new(p).map_err(|e| {
                     Error::ParametersError(ParametersError::InvalidPlaintextModulus {
                         modulus: p,
@@ -445,9 +449,8 @@ impl BfvParametersBuilder {
                     })
                 })?,
                 modulus_big: BigUint::from(p),
-            }
-        } else {
-            PlaintextModulus::Large(self.plaintext.clone())
+            },
+            None => PlaintextModulus::Large(self.plaintext.clone()),
         };
         let plaintext_big = plaintext_modulus_struct.as_biguint();
 
