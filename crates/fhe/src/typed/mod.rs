@@ -1,7 +1,42 @@
 //! Typed high-level API in the style of [tfhe-rs](https://docs.zama.ai/tfhe-rs).
 //!
-//! This module wraps the low-level BFV API ([`crate::bfv`]) in a typed
-//! integer, [`FheUint64`], whose homomorphic arithmetic matches Rust's
+//! This module wraps the low-level BFV API ([`crate::bfv`]) in two typed
+//! ciphertexts with different 64-bit plaintext semantics:
+//!
+//! - [`FheUint64`]: one `u64` per ciphertext with **wrapping integer
+//!   semantics** (t = 2^64), matching Rust's `wrapping_*` ops and the
+//!   message space of tfhe-rs' `FheUint64`.
+//! - [`FheGoldilocks`]: `degree` SIMD slots per ciphertext with **field
+//!   semantics** modulo the Goldilocks prime t = 2^64 - 2^32 + 1, the field
+//!   used by the Plonky2/Plonky3 zk proof systems.
+//!
+//! # Choosing between them
+//!
+//! | | `FheUint64` | `FheGoldilocks` |
+//! |---|---|---|
+//! | Plaintext modulus t | 2^64 | 2^64 - 2^32 + 1 (prime) |
+//! | Arithmetic | wrapping `u64` | field mod t |
+//! | SIMD slots | none (t not NTT-friendly) | `degree` slots |
+//! | Interop | tfhe-rs `FheUint64` message space | Plonky2/Plonky3 field |
+//!
+//! t = 2^64 admits no plaintext NTT (it is not prime, and no root of unity
+//! of the right order exists), so a `FheUint64` ciphertext carries a single
+//! value. The Goldilocks prime has 2^32 | t - 1, so a plaintext NTT exists
+//! for every practical degree and one ciphertext batches `degree` field
+//! elements — at degree 16384, a 16384x throughput advantage for slot-wise
+//! workloads.
+//!
+//! Both moduli are ~2^64, so they pay the same noise-budget cost: roughly
+//! 64 bits of every ciphertext-modulus level go to the message. The curated
+//! [`FheUint64::default_parameters_128`] and
+//! [`FheGoldilocks::default_parameters_128`] sets (degree 16384, 291-bit q)
+//! both support multiplicative depth 2 at 128-bit security; deeper circuits
+//! need a larger degree and ciphertext modulus, sized following the
+//! <https://homomorphicencryption.org> standard tables.
+//!
+//! # `FheUint64` semantics
+//!
+//! [`FheUint64`]'s homomorphic arithmetic matches Rust's
 //! wrapping `u64` semantics exactly: the plaintext modulus is fixed to
 //! t = 2^64, so `+`, `-`, `*` and unary `-` on ciphertexts decrypt to
 //! `wrapping_add`, `wrapping_sub`, `wrapping_mul` and `wrapping_neg` of the
@@ -50,6 +85,9 @@
 //!   bootstrapping in BFV, so unlike tfhe-rs the multiplicative depth is
 //!   bounded by the parameters; see [`FheUint64::default_parameters_128`].
 
+mod goldilocks;
+pub use goldilocks::{FheGoldilocks, GOLDILOCKS_MODULUS};
+
 use std::cell::RefCell;
 use std::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
 use std::sync::Arc;
@@ -88,7 +126,7 @@ thread_local! {
 /// Installs the server key used by the `*` operator on this thread.
 ///
 /// Mirrors tfhe-rs' `set_server_key`. Each thread that multiplies
-/// [`FheUint64`] values must install a key.
+/// [`FheUint64`] or [`FheGoldilocks`] values must install a key.
 pub fn set_server_key(key: ServerKey) {
     SERVER_KEY.with(|k| *k.borrow_mut() = Some(Arc::new(key)));
 }
