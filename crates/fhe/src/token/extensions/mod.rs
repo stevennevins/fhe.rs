@@ -18,3 +18,4 @@ pub mod freezable;
 pub mod identity;
 pub mod observer;
 pub mod restricted;
+pub mod wrapper;

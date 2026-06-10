@@ -7,6 +7,7 @@ use fhe::token::extensions::freezable::Freezable;
 use fhe::token::extensions::identity::{IdentityCheck, IdentityRegistry, InMemoryIdentityRegistry};
 use fhe::token::extensions::observer::Observers;
 use fhe::token::extensions::restricted::{Restriction, RestrictionMode, Restrictions};
+use fhe::token::extensions::wrapper::PublicLedger;
 use fhe::token::{Account, ConfidentialToken};
 use fhe::typed::{FheUint64, set_server_key};
 use rand::rng;
@@ -397,4 +398,166 @@ fn freezable_audit_log_leaks_no_raw_operands() {
         .confidential_available(&mut token, ALICE, &mut rng)
         .unwrap();
     assert_eq!(freezable.available_compares().len(), 1);
+}
+
+/// The confidential total supply, threshold-decrypted.
+fn confidential_supply(token: &ConfidentialToken) -> u64 {
+    token
+        .committee()
+        .threshold_decrypt(token.total_supply(), &mut rng())
+        .unwrap()
+}
+
+/// Round-trip: wrap 1000 -> confidential transfer 300 -> unwrap 700
+/// returns exactly 700 to the public ledger, with the reference model
+/// matching at every step.
+#[test]
+fn wrap_transfer_unwrap_round_trip() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut ledger = PublicLedger::new();
+    ledger.credit(ALICE, 1500);
+
+    ledger.wrap(&mut token, ALICE, 1000, &mut rng).unwrap();
+    assert_eq!(ledger.balance(ALICE), 500);
+    assert_eq!(balance_of(&token, ALICE), 1000);
+    assert_eq!(confidential_supply(&token), 1000);
+
+    let enc = token.committee().encrypt(300, &mut rng).unwrap();
+    token.transfer(ALICE, BOB, &enc, &mut rng).unwrap();
+    assert_eq!(balance_of(&token, ALICE), 700);
+    assert_eq!(balance_of(&token, BOB), 300);
+
+    let amount = token.committee().encrypt(700, &mut rng).unwrap();
+    let request = ledger.request_unwrap(ALICE, amount);
+    assert_eq!(request.account(), ALICE);
+    let revealed = ledger
+        .finalize_unwrap(&mut token, request, &mut rng)
+        .unwrap();
+    assert_eq!(revealed, 700);
+    assert_eq!(ledger.balance(ALICE), 1200);
+    assert_eq!(balance_of(&token, ALICE), 0);
+    assert_eq!(confidential_supply(&token), 300);
+    // Wrapping is possible again after unwrap freed supply headroom.
+    ledger.wrap(&mut token, ALICE, 100, &mut rng).unwrap();
+    assert_eq!(balance_of(&token, ALICE), 100);
+}
+
+/// Conservation: public total + decrypted confidential supply is
+/// constant across 20+ random wrap/transfer/unwrap operations.
+#[test]
+fn wrap_unwrap_conserves_combined_supply() {
+    use rand::Rng;
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut ledger = PublicLedger::new();
+    ledger.credit(ALICE, 10_000);
+    ledger.credit(BOB, 10_000);
+    let combined_total = 20_000;
+    // Seed both confidential balances so transfers/unwraps have funds.
+    ledger.wrap(&mut token, ALICE, 4_000, &mut rng).unwrap();
+    ledger.wrap(&mut token, BOB, 4_000, &mut rng).unwrap();
+
+    for i in 0..20 {
+        let (a, b) = if i % 2 == 0 {
+            (ALICE, BOB)
+        } else {
+            (BOB, ALICE)
+        };
+        let amount = rng.random_range(1..500u64);
+        match i % 3 {
+            0 => {
+                // May Err if the public balance is short; conservation
+                // must hold either way.
+                let _ = ledger.wrap(&mut token, a, amount, &mut rng);
+            }
+            1 => {
+                let enc = token.committee().encrypt(amount, &mut rng).unwrap();
+                token.transfer(a, b, &enc, &mut rng).unwrap();
+            }
+            _ => {
+                let enc = token.committee().encrypt(amount, &mut rng).unwrap();
+                let request = ledger.request_unwrap(a, enc);
+                let _ = ledger.finalize_unwrap(&mut token, request, &mut rng);
+            }
+        }
+        assert_eq!(
+            ledger.total() + confidential_supply(&token),
+            combined_total,
+            "conservation after operation {i}"
+        );
+    }
+}
+
+/// A finalize_unwrap whose account lacks the encrypted funds is an Err
+/// and credits nothing — the documented failure semantics, pinned.
+#[test]
+fn finalize_unwrap_without_funds_errs_and_credits_nothing() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut ledger = PublicLedger::new();
+    ledger.credit(ALICE, 1000);
+    ledger.wrap(&mut token, ALICE, 400, &mut rng).unwrap();
+
+    let enc = token.committee().encrypt(401, &mut rng).unwrap();
+    let request = ledger.request_unwrap(ALICE, enc);
+    assert!(
+        ledger
+            .finalize_unwrap(&mut token, request, &mut rng)
+            .is_err()
+    );
+    // Nothing credited, nothing debited.
+    assert_eq!(ledger.balance(ALICE), 600);
+    assert_eq!(balance_of(&token, ALICE), 400);
+    assert_eq!(confidential_supply(&token), 400);
+    // The failed attempt still revealed its amount (the documented
+    // leakage) and is in the audit log.
+    assert_eq!(ledger.audit_log().len(), 1);
+    assert_eq!(ledger.audit_log()[0].amount, 401);
+    assert!(ledger.audit_log()[0].refreshes.is_empty());
+}
+
+/// The unwrap-reveals-amount leakage is asserted against the transcript:
+/// the finalize step's decrypted value appears in the audit log, and the
+/// funds-check transcript still hides the raw balance.
+#[test]
+fn unwrap_reveals_amount_in_audit_log() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut ledger = PublicLedger::new();
+    ledger.credit(ALICE, 1000);
+    ledger.wrap(&mut token, ALICE, 800, &mut rng).unwrap();
+
+    let enc = token.committee().encrypt(150, &mut rng).unwrap();
+    let request = ledger.request_unwrap(ALICE, enc);
+    ledger
+        .finalize_unwrap(&mut token, request, &mut rng)
+        .unwrap();
+
+    let audit = &ledger.audit_log()[0];
+    // The decrypted unwrap amount is in the committee's transcript.
+    assert_eq!(audit.amount, 150);
+    assert_eq!(audit.refreshes.len(), 1);
+    // The funds check still hides the raw balance from any single party.
+    assert_ne!(audit.guard_compare.revealed, 800);
+    assert_ne!(audit.guard_compare.revealed, 800 - 150);
+    for blind in &audit.guard_compare.blinds {
+        assert!(*blind >= 3);
+        assert_ne!(audit.guard_compare.revealed / blind, 800 - 150);
+    }
+}
+
+/// Public-side checks are public: wrapping more than the public balance
+/// is a structural Err before any encrypted work.
+#[test]
+fn wrap_beyond_public_balance_errs() {
+    let mut rng = rng();
+    let mut token = toy_token();
+    let mut ledger = PublicLedger::new();
+    ledger.credit(ALICE, 100);
+    let handles_before = token.handles().len();
+    assert!(ledger.wrap(&mut token, ALICE, 101, &mut rng).is_err());
+    assert_eq!(token.handles().len(), handles_before);
+    assert_eq!(ledger.balance(ALICE), 100);
+    assert_eq!(ledger.total(), 100);
 }
