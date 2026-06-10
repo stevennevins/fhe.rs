@@ -1,0 +1,30 @@
+[package]
+name = "fhe-coprocessor"
+description = "Off-chain FHE coprocessor driving the fhe.rs confidential token kit from on-chain transactions"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+cuda = ["fhe/cuda"]
+
+[dependencies]
+fhe = { version = "=0.2.0", path = "../fhe" }
+fhe-traits = { version = "=0.1.1", path = "../fhe-traits" }
+
+alloy.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
