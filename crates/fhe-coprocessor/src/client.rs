@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 
 use crate::abi::IConfidentialTokenGateway::{self as gw, IConfidentialTokenGatewayInstance};
 use crate::coprocessor::Coprocessor;
+use crate::harness::wait_receipt;
 use crate::{Error, Result, chain_err};
 
 /// Every request event's signature hash; the request id is `topics[1]`
@@ -74,7 +75,8 @@ macro_rules! transact {
             )));
         }
         let id = request_id(&receipt)?;
-        $self.wait_fulfilled(&mut fulfillments, id).await
+        let sent_at = receipt.block_number.unwrap_or(0);
+        $self.wait_fulfilled(&mut fulfillments, id, sent_at).await
     }};
 }
 
@@ -296,13 +298,17 @@ impl Client {
     /// the subscription. The websocket subscription buffer is small and
     /// silently lossy under load (alloy drops on broadcast lag), so a
     /// quiet stream is periodically cross-checked against the durable
-    /// event log — the subscription is the fast path, the log the
-    /// source of truth.
+    /// event log from `sent_at` (the request's block — the fulfillment
+    /// cannot precede it) — the subscription is the fast path, the log
+    /// the source of truth. A dead operator fails loudly after five
+    /// minutes of silence rather than hanging the caller forever.
     async fn wait_fulfilled(
         &self,
         fulfillments: &mut (impl Stream<Item = Log> + Unpin),
         id: u64,
+        sent_at: u64,
     ) -> Result<Log> {
+        let mut quiet_checks = 0;
         loop {
             match tokio::time::timeout(Duration::from_secs(2), fulfillments.next()).await {
                 Ok(Some(log)) => {
@@ -316,7 +322,9 @@ impl Client {
                     )));
                 }
                 Err(_quiet) => {
-                    let filter = Filter::new().address(*self.gateway.address()).from_block(0);
+                    let filter = Filter::new()
+                        .address(*self.gateway.address())
+                        .from_block(sent_at);
                     let logs = self
                         .gateway
                         .provider()
@@ -328,6 +336,13 @@ impl Client {
                         .find(|log| event_id(log, &FULFILLMENT_EVENTS) == Some(id))
                     {
                         return Ok(log.clone());
+                    }
+                    quiet_checks += 1;
+                    if quiet_checks >= 150 {
+                        return Err(Error::Chain(format!(
+                            "request {id} was not fulfilled after 5 minutes of quiet — \
+                             is the operator running?"
+                        )));
                     }
                 }
             }
@@ -354,29 +369,6 @@ fn request_id(receipt: &TransactionReceipt) -> Result<u64> {
                 receipt.transaction_hash
             ))
         })
-}
-
-/// Fetches the receipt of `hash` by direct lookup, retrying until the
-/// transaction is mined (bounded). The ws `get_receipt` watcher can
-/// miss an instantly-mined transaction when the heartbeat's block
-/// subscription lags (its buffer drops silently), which strands the
-/// caller forever on an automining devnet — a direct lookup cannot.
-pub(crate) async fn wait_receipt(provider: &DynProvider, hash: B256) -> Result<TransactionReceipt> {
-    // 30 s: an automined receipt is available within one round trip;
-    // this bound only decides how loudly a dropped transaction fails.
-    for _ in 0..600 {
-        if let Some(receipt) = provider
-            .get_transaction_receipt(hash)
-            .await
-            .map_err(chain_err)?
-        {
-            return Ok(receipt);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    Err(Error::Chain(format!(
-        "transaction {hash} was not mined within 30s"
-    )))
 }
 
 /// The `uint64 indexed id` of `log` if its event is one of `events`.

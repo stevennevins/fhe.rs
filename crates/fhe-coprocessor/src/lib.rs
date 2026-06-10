@@ -52,7 +52,7 @@ pub use client::Client;
 pub use coprocessor::Coprocessor;
 pub use operator::{Operator, OperatorHandle, OperatorState};
 
-/// Errors of the coprocessor service.
+/// Errors of the coprocessor crate.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// An error from the FHE kit underneath.

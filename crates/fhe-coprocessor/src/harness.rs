@@ -38,6 +38,32 @@ pub async fn connect(ws_url: &str, signer: PrivateKeySigner) -> Result<DynProvid
     Ok(provider.erased())
 }
 
+/// Fetches the receipt of `hash` by direct lookup, retrying until the
+/// transaction is mined (bounded). The ws `get_receipt` watcher can
+/// miss an instantly-mined transaction when the heartbeat's block
+/// subscription lags (its buffer drops silently), which strands the
+/// caller forever on an automining devnet — a direct lookup cannot.
+pub async fn wait_receipt(
+    provider: &DynProvider,
+    hash: alloy::primitives::B256,
+) -> Result<alloy::rpc::types::TransactionReceipt> {
+    // 30 s: an automined receipt is available within one round trip;
+    // this bound only decides how loudly a dropped transaction fails.
+    for _ in 0..600 {
+        if let Some(receipt) = provider
+            .get_transaction_receipt(hash)
+            .await
+            .map_err(chain_err)?
+        {
+            return Ok(receipt);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err(Error::Chain(format!(
+        "transaction {hash} was not mined within 30s"
+    )))
+}
+
 /// Whether `anvil` and `forge` are runnable on this machine. Tests that
 /// need a devnet should return early (with a loud message) when false:
 ///

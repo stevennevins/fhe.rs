@@ -30,7 +30,8 @@ use futures_util::StreamExt;
 use tokio::sync::{Mutex, MutexGuard, oneshot};
 
 use crate::abi::IConfidentialTokenGateway::{self, IConfidentialTokenGatewayInstance};
-use crate::client::{Client, wait_receipt};
+use crate::client::Client;
+use crate::harness::wait_receipt;
 use crate::requests::{Fulfillment, Request};
 use crate::{Coprocessor, Error, Result, chain_err};
 
@@ -270,8 +271,10 @@ impl Operator {
 }
 
 /// A running operator loop. [`OperatorHandle::shutdown`] stops it
-/// cleanly and returns the operator; dropping the handle aborts the
-/// loop without handover.
+/// cleanly and returns the operator. Dropping the handle instead
+/// detaches the task: the dropped stop sender resolves the loop's stop
+/// branch, so it finishes the request it is processing and exits — but
+/// the operator (and its durable state) is lost, not handed over.
 pub struct OperatorHandle {
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<Result<Operator>>,

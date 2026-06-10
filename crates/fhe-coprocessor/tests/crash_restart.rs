@@ -41,10 +41,16 @@ async fn crash_and_restart_resumes_from_the_last_fulfilled_request() {
     let raw_alice = IConfidentialTokenGateway::new(devnet.gateway, alice.provider.clone());
     let raw_agent = IConfidentialTokenGateway::new(devnet.gateway, devnet.agent.provider.clone());
 
+    // Receipts by direct lookup: the ws get_receipt watcher can miss
+    // an automined block and hang (see harness::wait_receipt).
     macro_rules! request {
-        ($call:expr) => {
-            $call.send().await.unwrap().get_receipt().await.unwrap()
-        };
+        ($call:expr) => {{
+            let pending = $call.send().await.unwrap();
+            let provider = alice.provider.clone();
+            harness::wait_receipt(&provider, *pending.tx_hash())
+                .await
+                .unwrap()
+        }};
     }
     request!(raw_agent.setVerified(bob.address, true));
     request!(raw_alice.faucet(1000));
