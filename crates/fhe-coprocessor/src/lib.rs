@@ -43,16 +43,14 @@
 
 pub mod abi;
 pub mod client;
-pub mod coprocessor;
+mod coprocessor;
 pub mod harness;
 pub mod operator;
-pub mod requests;
-pub mod service;
+mod requests;
 
 pub use client::Client;
 pub use coprocessor::Coprocessor;
 pub use operator::{Operator, OperatorHandle, OperatorState};
-pub use service::Service;
 
 /// Errors of the coprocessor service.
 #[derive(Debug, thiserror::Error)]

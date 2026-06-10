@@ -8,6 +8,9 @@ use std::sync::OnceLock;
 
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::Address;
+use alloy::providers::fillers::{
+    BlobGasFiller, ChainIdFiller, GasFiller, NonceFiller, SimpleNonceManager,
+};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
@@ -16,8 +19,18 @@ use crate::{Error, Result, chain_err};
 
 /// Connects a wallet-backed websocket provider to the devnet, type-erased
 /// so tests and the coprocessor loop need no provider generics.
+///
+/// Nonces are fetched fresh per transaction (`SimpleNonceManager`)
+/// instead of the default cached manager: the fillers prepare jointly,
+/// so a send that fails gas estimation (an expected revert — public
+/// policy checks) would still burn a cached nonce and strand every
+/// later transaction from that wallet behind the gap.
 pub async fn connect(ws_url: &str, signer: PrivateKeySigner) -> Result<DynProvider> {
-    let provider = ProviderBuilder::new()
+    let provider = ProviderBuilder::default()
+        .filler(GasFiller)
+        .filler(BlobGasFiller::default())
+        .filler(NonceFiller::new(SimpleNonceManager::default()))
+        .filler(ChainIdFiller::default())
         .wallet(EthereumWallet::from(signer))
         .connect_ws(WsConnect::new(ws_url))
         .await

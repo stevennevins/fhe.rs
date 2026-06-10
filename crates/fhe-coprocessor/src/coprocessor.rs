@@ -28,12 +28,6 @@ struct StoredCiphertext {
     commitment: B256,
 }
 
-/// A registered encrypted input, spendable (on-chain) only by `owner`.
-struct EncryptedInput {
-    ciphertext: FheUint64,
-    owner: Address,
-}
-
 /// The kit account bound to the agent address (account 0, matching
 /// `Rwa::new`).
 const AGENT_ACCOUNT: u64 = 0;
@@ -55,7 +49,8 @@ pub struct Coprocessor {
     /// event order (deterministic under replay).
     accounts: HashMap<Address, u64>,
     next_account: u64,
-    inputs: HashMap<B256, EncryptedInput>,
+    /// Registered input ciphertexts (ownership is enforced on-chain).
+    inputs: HashMap<B256, FheUint64>,
     store: HashMap<B256, StoredCiphertext>,
     /// On-chain handle → kit-internal handle for coprocessor outputs.
     kit_handles: HashMap<B256, fhe::token::Handle>,
@@ -64,10 +59,11 @@ pub struct Coprocessor {
 }
 
 impl Coprocessor {
-    /// Creates the durable state: a fresh token under `committee` (whose
-    /// `params` the caller already holds) with `agent` holding the agent
-    /// (and freezer) role.
-    pub fn new(committee: Committee, params: Arc<BfvParameters>, agent: Address) -> Result<Self> {
+    /// Creates the durable state: a fresh token under `committee` (which
+    /// knows its own parameters) with `agent` holding the agent (and
+    /// freezer) role.
+    pub fn new(committee: Committee, agent: Address) -> Result<Self> {
+        let params = committee.params().clone();
         let mut rng = ChaCha20Rng::from_os_rng();
         let token = ConfidentialToken::new(committee, &mut rng)?;
         let mut accounts = HashMap::new();
@@ -107,12 +103,6 @@ impl Coprocessor {
         &self.rwa
     }
 
-    /// The observer registry mirrored from on-chain `setObserver` calls.
-    #[must_use]
-    pub fn observers(&self) -> &Observers {
-        &self.observers
-    }
-
     /// The public-ledger mirror (faucet credits, wrap/unwrap audits).
     #[must_use]
     pub fn ledger(&self) -> &PublicLedger {
@@ -138,10 +128,10 @@ impl Coprocessor {
     /// deserialize to an [`FheUint64`] under the deployment parameters,
     /// stores the ciphertext, and returns `(handle, commitment)` — the
     /// commitment is `keccak256(bytes)` and the handle is a fresh opaque
-    /// id. The caller (the service loop) anchors the pair on-chain via
-    /// `registerInput`; the user then passes only the handle in their
-    /// transaction.
-    pub fn register_input(&mut self, owner: Address, bytes: &[u8]) -> Result<(B256, B256)> {
+    /// id. The caller (the client) anchors the pair on-chain via
+    /// `registerInput`, which is where ownership is bound and enforced;
+    /// the user then passes only the handle in their transaction.
+    pub fn register_input(&mut self, bytes: &[u8]) -> Result<(B256, B256)> {
         let ciphertext = FheUint64::from_bytes(bytes, &self.params)?;
         let commitment = keccak256(bytes);
         let handle = self.fresh_handle(commitment);
@@ -152,8 +142,7 @@ impl Coprocessor {
                 commitment,
             },
         );
-        self.inputs
-            .insert(handle, EncryptedInput { ciphertext, owner });
+        self.inputs.insert(handle, ciphertext);
         Ok((handle, commitment))
     }
 
@@ -161,12 +150,6 @@ impl Coprocessor {
     #[must_use]
     pub fn stored_bytes(&self, handle: B256) -> Option<&[u8]> {
         self.store.get(&handle).map(|s| s.bytes.as_slice())
-    }
-
-    /// The commitment recorded for `handle` at registration time.
-    #[must_use]
-    pub fn stored_commitment(&self, handle: B256) -> Option<B256> {
-        self.store.get(&handle).map(|s| s.commitment)
     }
 
     /// Whether the bytes stored behind `handle` still hash to the
@@ -192,13 +175,6 @@ impl Coprocessor {
         Ok(())
     }
 
-    /// The address allowed (on-chain) to spend the registered input
-    /// behind `handle`.
-    #[must_use]
-    pub fn input_owner(&self, handle: B256) -> Option<Address> {
-        self.inputs.get(&handle).map(|i| i.owner)
-    }
-
     /// The registered input ciphertext behind `handle`, integrity-checked
     /// against its commitment before use.
     pub fn input_ciphertext(&self, handle: B256) -> Result<&FheUint64> {
@@ -209,7 +185,6 @@ impl Coprocessor {
         }
         self.inputs
             .get(&handle)
-            .map(|i| &i.ciphertext)
             .ok_or_else(|| Error::State(format!("no registered input behind handle {handle}")))
     }
 
@@ -227,7 +202,7 @@ impl Coprocessor {
     /// Errors mean a structural inconsistency between the chain and the
     /// mirror (a missing input, a corrupted store) and stop the loop
     /// loudly rather than skipping a request.
-    pub fn process(&mut self, request: &Request) -> Result<Fulfillment> {
+    pub(crate) fn process(&mut self, request: &Request) -> Result<Fulfillment> {
         // Multiplications (cmux/select) need the relinearization key on
         // the executing thread.
         set_server_key(self.token.committee().server_key());

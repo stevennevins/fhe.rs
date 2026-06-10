@@ -15,6 +15,7 @@
 //! ciphertext store, and no request processing.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
 use alloy::providers::{DynProvider, Provider};
@@ -64,13 +65,8 @@ const FULFILLMENT_EVENTS: [B256; 6] = [
 macro_rules! transact {
     ($self:expr, $call:expr) => {{
         let mut fulfillments = $self.subscribe().await?;
-        let receipt = $call
-            .send()
-            .await
-            .map_err(chain_err)?
-            .get_receipt()
-            .await
-            .map_err(chain_err)?;
+        let pending = $call.send().await.map_err(chain_err)?;
+        let receipt = wait_receipt($self.gateway.provider(), *pending.tx_hash()).await?;
         if !receipt.status() {
             return Err(Error::Chain(format!(
                 "transaction {} reverted",
@@ -78,7 +74,7 @@ macro_rules! transact {
             )));
         }
         let id = request_id(&receipt)?;
-        wait_fulfilled(&mut fulfillments, id).await
+        $self.wait_fulfilled(&mut fulfillments, id).await
     }};
 }
 
@@ -138,16 +134,14 @@ impl Client {
         // wallet is the operator's fulfillment wallet, and the lock
         // serializes their nonces (see the operator module docs).
         let mut state = self.state.lock().await;
-        let (handle, commitment) = state.register_input(self.address, &bytes)?;
-        let receipt = self
+        let (handle, commitment) = state.register_input(&bytes)?;
+        let pending = self
             .anchor
             .registerInput(handle, commitment, self.address)
             .send()
             .await
-            .map_err(chain_err)?
-            .get_receipt()
-            .await
             .map_err(chain_err)?;
+        let receipt = wait_receipt(self.anchor.provider(), *pending.tx_hash()).await?;
         if !receipt.status() {
             return Err(Error::Chain(format!(
                 "registerInput reverted in tx {}",
@@ -297,6 +291,48 @@ impl Client {
             .map_err(chain_err)?
             .into_stream())
     }
+
+    /// Resolves when the fulfillment event for request `id` arrives on
+    /// the subscription. The websocket subscription buffer is small and
+    /// silently lossy under load (alloy drops on broadcast lag), so a
+    /// quiet stream is periodically cross-checked against the durable
+    /// event log — the subscription is the fast path, the log the
+    /// source of truth.
+    async fn wait_fulfilled(
+        &self,
+        fulfillments: &mut (impl Stream<Item = Log> + Unpin),
+        id: u64,
+    ) -> Result<Log> {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), fulfillments.next()).await {
+                Ok(Some(log)) => {
+                    if event_id(&log, &FULFILLMENT_EVENTS) == Some(id) {
+                        return Ok(log);
+                    }
+                }
+                Ok(None) => {
+                    return Err(Error::Chain(format!(
+                        "event subscription ended before request {id} was fulfilled"
+                    )));
+                }
+                Err(_quiet) => {
+                    let filter = Filter::new().address(*self.gateway.address()).from_block(0);
+                    let logs = self
+                        .gateway
+                        .provider()
+                        .get_logs(&filter)
+                        .await
+                        .map_err(chain_err)?;
+                    if let Some(log) = logs
+                        .iter()
+                        .find(|log| event_id(log, &FULFILLMENT_EVENTS) == Some(id))
+                    {
+                        return Ok(log.clone());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A thread-local CSPRNG; the user never threads an rng through the
@@ -320,18 +356,26 @@ fn request_id(receipt: &TransactionReceipt) -> Result<u64> {
         })
 }
 
-/// Resolves when the fulfillment event for request `id` arrives.
-async fn wait_fulfilled(
-    fulfillments: &mut (impl Stream<Item = Log> + Unpin),
-    id: u64,
-) -> Result<Log> {
-    while let Some(log) = fulfillments.next().await {
-        if event_id(&log, &FULFILLMENT_EVENTS) == Some(id) {
-            return Ok(log);
+/// Fetches the receipt of `hash` by direct lookup, retrying until the
+/// transaction is mined (bounded). The ws `get_receipt` watcher can
+/// miss an instantly-mined transaction when the heartbeat's block
+/// subscription lags (its buffer drops silently), which strands the
+/// caller forever on an automining devnet — a direct lookup cannot.
+pub(crate) async fn wait_receipt(provider: &DynProvider, hash: B256) -> Result<TransactionReceipt> {
+    // 30 s: an automined receipt is available within one round trip;
+    // this bound only decides how loudly a dropped transaction fails.
+    for _ in 0..600 {
+        if let Some(receipt) = provider
+            .get_transaction_receipt(hash)
+            .await
+            .map_err(chain_err)?
+        {
+            return Ok(receipt);
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err(Error::Chain(format!(
-        "event subscription ended before request {id} was fulfilled"
+        "transaction {hash} was not mined within 30s"
     )))
 }
 

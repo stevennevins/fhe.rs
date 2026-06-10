@@ -30,10 +30,14 @@ use futures_util::StreamExt;
 use tokio::sync::{Mutex, MutexGuard, oneshot};
 
 use crate::abi::IConfidentialTokenGateway::{self, IConfidentialTokenGatewayInstance};
-use crate::client::Client;
-use crate::requests::Request;
-use crate::service::send_fulfillment;
+use crate::client::{Client, wait_receipt};
+use crate::requests::{Fulfillment, Request};
 use crate::{Coprocessor, Error, Result, chain_err};
+
+/// How long a quiet event subscription waits before cross-checking the
+/// durable log (the ws buffer drops silently on lag; see the client
+/// module on why the subscription is only the fast path).
+const RESYNC_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The operator's durable state, detached from any event loop — what a
 /// crashed operator hands over to its replacement. Opaque: only
@@ -59,8 +63,7 @@ impl Operator {
         provider: DynProvider,
         address: Address,
     ) -> Result<Self> {
-        let params = committee.params().clone();
-        let coprocessor = Coprocessor::new(committee, params, agent)?;
+        let coprocessor = Coprocessor::new(committee, agent)?;
         Ok(Self::resume(
             OperatorState(Arc::new(Mutex::new(coprocessor))),
             provider,
@@ -165,13 +168,22 @@ impl Operator {
                 next += 1;
                 continue;
             }
-            let log = live.next().await.ok_or_else(|| {
-                Error::Chain("event subscription ended before the target request".to_string())
-            })?;
-            if let Some(request) = Request::from_log(&log)?
-                && request.id() >= next
-            {
-                pending.insert(request.id(), request);
+            match tokio::time::timeout(RESYNC_AFTER, live.next()).await {
+                Ok(Some(log)) => {
+                    if let Some(request) = Request::from_log(&log)?
+                        && request.id() >= next
+                    {
+                        pending.insert(request.id(), request);
+                    }
+                }
+                Ok(None) => {
+                    return Err(Error::Chain(
+                        "event subscription ended before the target request".to_string(),
+                    ));
+                }
+                // Quiet too long while a request is owed: the
+                // subscription may have dropped it — resync from the log.
+                Err(_quiet) => pending.append(&mut self.replay_history(&filter, next).await?),
             }
         }
     }
@@ -208,6 +220,12 @@ impl Operator {
                     {
                         pending.insert(request.id(), request);
                     }
+                }
+                // Quiet too long: the subscription may have dropped an
+                // event (its buffer is lossy on lag) — resync from the
+                // durable log.
+                () = tokio::time::sleep(RESYNC_AFTER) => {
+                    pending.append(&mut self.replay_history(&filter, next).await?);
                 }
             }
         }
@@ -276,4 +294,110 @@ impl OperatorHandle {
             .await
             .map_err(|e| Error::State(format!("operator task panicked: {e}")))?
     }
+}
+
+/// Posts one fulfillment transaction and returns its hash. A revert is
+/// an error: it means the fulfillment did not match its request, which
+/// is a bug, not a condition to swallow.
+async fn send_fulfillment(
+    gateway: &IConfidentialTokenGatewayInstance<DynProvider>,
+    fulfillment: &Fulfillment,
+) -> Result<B256> {
+    // Each generated call builder is its own type, so the send happens
+    // inside the match arms.
+    macro_rules! send {
+        ($call:expr) => {
+            $call.send().await.map_err(chain_err)?
+        };
+    }
+    let pending = match *fulfillment {
+        Fulfillment::Ack { id } => send!(gateway.fulfillAck(id)),
+        Fulfillment::Wrap {
+            id,
+            account,
+            amount,
+            new_balance,
+        } => send!(gateway.fulfillWrap(
+            id,
+            account,
+            amount,
+            new_balance.handle,
+            new_balance.commitment,
+        )),
+        Fulfillment::Transfer {
+            id,
+            from,
+            to,
+            amount_handle,
+            new_from,
+            new_to,
+            transferred,
+        } => send!(gateway.fulfillTransfer(
+            id,
+            from,
+            to,
+            amount_handle,
+            new_from.handle,
+            new_from.commitment,
+            new_to.handle,
+            new_to.commitment,
+            transferred.handle,
+            transferred.commitment,
+        )),
+        Fulfillment::FrozenSet {
+            id,
+            account,
+            amount_handle,
+            new_frozen,
+        } => send!(gateway.fulfillFrozenSet(
+            id,
+            account,
+            amount_handle,
+            new_frozen.handle,
+            new_frozen.commitment,
+        )),
+        Fulfillment::Recover {
+            id,
+            lost,
+            recipient,
+            new_lost,
+            new_recipient,
+            new_recipient_frozen,
+        } => send!(gateway.fulfillRecover(
+            id,
+            lost,
+            recipient,
+            new_lost.handle,
+            new_lost.commitment,
+            new_recipient.handle,
+            new_recipient.commitment,
+            new_recipient_frozen.handle,
+            new_recipient_frozen.commitment,
+        )),
+        Fulfillment::Unwrap {
+            id,
+            account,
+            amount_handle,
+            amount,
+            success,
+            new_balance,
+        } => send!(gateway.fulfillUnwrap(
+            id,
+            account,
+            amount_handle,
+            amount,
+            success,
+            new_balance.handle,
+            new_balance.commitment,
+        )),
+    };
+    let receipt = wait_receipt(gateway.provider(), *pending.tx_hash()).await?;
+    if !receipt.status() {
+        return Err(Error::Chain(format!(
+            "fulfillment of request {} reverted in tx {}",
+            fulfillment.id(),
+            receipt.transaction_hash
+        )));
+    }
+    Ok(receipt.transaction_hash)
 }

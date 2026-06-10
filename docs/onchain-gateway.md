@@ -48,7 +48,7 @@ than re-implementing their circuits.
 Ciphertexts never enter calldata: a degree-16384 ciphertext is megabytes
 and the chain carries only 32-byte values. A user submits an encrypted
 amount (a serialized `FheUint64`) to the coprocessor **off-chain**
-(`Coprocessor::register_input` via `Service::register_and_anchor`),
+(`Client::encrypt_input`, which encrypts, registers, and anchors),
 which validates it against the deployment parameters, stores the bytes,
 anchors `(handle, commitment = keccak256(bytes), owner)` on-chain with
 `registerInput`, and returns the handle. The user's transaction then
