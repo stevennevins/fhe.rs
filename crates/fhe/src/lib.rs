@@ -7,6 +7,7 @@ mod errors;
 pub mod bfv;
 pub mod mbfv;
 pub mod proto;
+pub mod typed;
 pub use errors::{Error, ParametersError, Result, SerializationError};
 
 // Test the source code included in the README.
