@@ -30,14 +30,15 @@ use tokio::sync::Mutex;
 use crate::abi::IConfidentialTokenGateway::{self as gw, IConfidentialTokenGatewayInstance};
 use crate::coprocessor::Coprocessor;
 use crate::harness::wait_receipt;
-use crate::requests::ops;
+use crate::requests::{OpSpec, ops};
 use crate::{Error, Result, chain_err};
 
 /// Every request event's signature hash; the request id is `topics[1]`
 /// in all of them.
-const REQUEST_EVENTS: [B256; 13] = [
+const REQUEST_EVENTS: [B256; 14] = [
     gw::AllowRequested::SIGNATURE_HASH,
     gw::OpRequested::SIGNATURE_HASH,
+    gw::BatchRequested::SIGNATURE_HASH,
     gw::FaucetRequested::SIGNATURE_HASH,
     gw::WrapRequested::SIGNATURE_HASH,
     gw::TransferRequested::SIGNATURE_HASH,
@@ -53,8 +54,9 @@ const REQUEST_EVENTS: [B256; 13] = [
 
 /// Every fulfillment event's signature hash; the fulfilled request id
 /// is `topics[1]` in all of them.
-const FULFILLMENT_EVENTS: [B256; 7] = [
+const FULFILLMENT_EVENTS: [B256; 8] = [
     gw::OpFulfilled::SIGNATURE_HASH,
+    gw::BatchFulfilled::SIGNATURE_HASH,
     gw::RequestAcked::SIGNATURE_HASH,
     gw::WrapFulfilled::SIGNATURE_HASH,
     gw::TransferFulfilled::SIGNATURE_HASH,
@@ -250,6 +252,45 @@ impl Client {
     /// Symbolic `cond ? lhs : rhs` (euint64; `cond` is an ebool).
     pub async fn select(&self, cond: B256, lhs: B256, rhs: B256) -> Result<B256> {
         self.request_op(ops::SELECT, lhs, rhs, cond).await
+    }
+
+    /// Requests an atomic ordered batch of symbolic ops: one
+    /// transaction, one request id, one fulfillment. Later ops may
+    /// reference earlier results via [`OpSpec::result_of`]. Returns
+    /// the result handles (one per op), resolving when the whole
+    /// batch has materialized.
+    pub async fn batch(&self, specs: &[OpSpec]) -> Result<Vec<B256>> {
+        let ops: Vec<gw::SymbolicOp> = specs.iter().map(Into::into).collect();
+        let mut fulfillments = self.subscribe().await?;
+        let pending = self
+            .gateway
+            .requestBatch(ops)
+            .send()
+            .await
+            .map_err(chain_err)?;
+        let receipt = wait_receipt(self.gateway.provider(), *pending.tx_hash()).await?;
+        if !receipt.status() {
+            return Err(Error::Chain(format!(
+                "transaction {} reverted",
+                receipt.transaction_hash
+            )));
+        }
+        let id = request_id(&receipt)?;
+        // The contract-derived result handles, from the request event.
+        let results = receipt
+            .logs()
+            .iter()
+            .find_map(|log| log.log_decode::<gw::BatchRequested>().ok())
+            .map(|decoded| decoded.inner.data.results)
+            .ok_or_else(|| {
+                Error::Chain(format!(
+                    "transaction {} emitted no BatchRequested event",
+                    receipt.transaction_hash
+                ))
+            })?;
+        let sent_at = receipt.block_number.unwrap_or(0);
+        self.wait_fulfilled(&mut fulfillments, id, sent_at).await?;
+        Ok(results)
     }
 
     /// Decrypts any on-chain handle this client's address is allowed

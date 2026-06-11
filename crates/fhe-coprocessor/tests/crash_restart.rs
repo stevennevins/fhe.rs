@@ -6,10 +6,11 @@
 
 mod common;
 
+use alloy::primitives::B256;
 use fhe::gateway::Committee;
 use fhe::typed::FheUint64;
 use fhe_coprocessor::abi::IConfidentialTokenGateway;
-use fhe_coprocessor::{Operator, harness};
+use fhe_coprocessor::{OpSpec, Operator, harness, ops, symbolic_handle, types};
 use rand::rng;
 
 #[tokio::test]
@@ -98,4 +99,54 @@ async fn crash_and_restart_resumes_from_the_last_fulfilled_request() {
     // Idempotency holds for a second catch-up too: nothing re-applies.
     restarted.run_until_idle().await.unwrap();
     assert_eq!(as_alice.balance(alice.address).await.unwrap(), 650);
+
+    // --- Goal H3: the crash boundary crosses a BATCH. One batch (one
+    // request id, intra-batch reference included) is requested, the
+    // loop dies before fulfilling any of it, and the restarted
+    // operator materializes the whole batch exactly once.
+    let x = as_alice.encrypt_input(30).await.unwrap();
+    let y = as_alice.encrypt_input(20).await.unwrap();
+    let batch_id = raw_agent.nextRequestId().call().await.unwrap();
+    let batch_ops = vec![
+        (&OpSpec::ge(x, y)).into(),
+        (&OpSpec::select(OpSpec::result_of(0), x, y)).into(),
+    ];
+    request!(raw_alice.requestBatch(batch_ops));
+
+    // The crash: state handed over before the batch is touched.
+    let second = Operator::resume(
+        restarted.into_state(),
+        devnet.coprocessor.provider.clone(),
+        devnet.gateway,
+    );
+    second.run_until_idle().await.unwrap();
+
+    // The contract-derived result handles (refs resolved before
+    // hashing), materialized once and decryptable through the ACL.
+    let won = symbolic_handle(ops::GE, x, y, B256::ZERO, batch_id, 0, types::EBOOL);
+    let max = symbolic_handle(ops::SELECT, x, y, won, batch_id, 1, types::EUINT64);
+    assert_eq!(
+        second
+            .state()
+            .await
+            .decrypt_for(won, alice.address)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        second
+            .state()
+            .await
+            .decrypt_for(max, alice.address)
+            .unwrap(),
+        30
+    );
+    assert_eq!(
+        raw_agent.lastFulfilledId().call().await.unwrap(),
+        raw_agent.nextRequestId().call().await.unwrap() - 1
+    );
+    // Exactly one ge executed; a second catch-up re-executes nothing.
+    assert_eq!(second.state().await.op_compares().len(), 1);
+    second.run_until_idle().await.unwrap();
+    assert_eq!(second.state().await.op_compares().len(), 1);
 }

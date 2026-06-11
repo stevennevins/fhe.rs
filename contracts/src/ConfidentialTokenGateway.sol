@@ -103,6 +103,7 @@ contract ConfidentialTokenGateway {
     uint8 public constant OP_UNWRAP = 11;
     uint8 public constant OP_ALLOW = 12;
     uint8 public constant OP_SYMBOLIC = 13;
+    uint8 public constant OP_BATCH = 14;
 
     // ------------------------------------------------------------------
     // Symbolic encrypted ops (Goal H2): a small fixed alphabet over
@@ -129,6 +130,27 @@ contract ConfidentialTokenGateway {
     /// inputs and fulfillment outputs are euint64 by construction.
     mapping(bytes32 => uint8) private symbolicType;
 
+    /// @notice One op of an atomic batch. Operands may be real handles
+    /// or `batchRef(i)` markers referencing the result of an EARLIER op
+    /// in the same batch (result handles embed the request id, so an
+    /// off-chain builder cannot know them in advance; a contract caller
+    /// gets the real handles back from `requestBatch` synchronously).
+    struct SymbolicOp {
+        uint8 op;
+        bytes32 lhs;
+        bytes32 rhs;
+        bytes32 cond;
+    }
+
+    /// @notice Hard batch-size bound, pinned by a forge test: bounded
+    /// loops keep request and fulfillment gas predictable. A documented
+    /// limit, not an implicit one.
+    uint256 public constant MAX_BATCH_OPS = 32;
+
+    /// @dev Intra-batch reference marker prefix (first 24 bytes of
+    /// keccak256("fhe.rs/ref")); the low 8 bytes carry the op index.
+    bytes24 internal constant REF_PREFIX = bytes24(keccak256("fhe.rs/ref"));
+
     // ------------------------------------------------------------------
     // Request events (decoded by the coprocessor, processed in id order).
     // ------------------------------------------------------------------
@@ -153,6 +175,7 @@ contract ConfidentialTokenGateway {
         bytes32 cond,
         bytes32 result
     );
+    event BatchRequested(uint64 indexed id, address indexed caller, SymbolicOp[] ops, bytes32[] results);
 
     /// @notice An encrypted input was anchored by the coprocessor.
     event InputRegistered(bytes32 indexed handle, bytes32 commitment, address indexed owner);
@@ -187,6 +210,7 @@ contract ConfidentialTokenGateway {
         uint64 indexed id, address indexed account, uint64 amount, bool success, bytes32 newBalanceHandle
     );
     event OpFulfilled(uint64 indexed id, bytes32 indexed result);
+    event BatchFulfilled(uint64 indexed id);
 
     error NotAgent();
     error NotCoprocessor();
@@ -204,6 +228,10 @@ contract ConfidentialTokenGateway {
     error UnknownOp(uint8 op);
     error WrongArity(uint8 op);
     error WrongOperandType(bytes32 handle);
+    error EmptyBatch();
+    error BatchTooLarge(uint256 size);
+    error RefOutOfRange(bytes32 handle, uint256 resolvableBelow);
+    error BatchShapeMismatch(uint64 id);
 
     modifier onlyAgent() {
         if (msg.sender != agent) revert NotAgent();
@@ -283,6 +311,39 @@ contract ConfidentialTokenGateway {
         symbolicType[result] = typeTag + 1;
         _allow(result, msg.sender);
         emit OpRequested(id, msg.sender, op, lhs, rhs, cond, result);
+    }
+
+    /// @notice Requests an atomic ordered batch of symbolic ops in one
+    /// transaction: one request id, one fulfillment. Later ops may
+    /// reference earlier results via `batchRef(i)` markers (resolved
+    /// here, deterministically, before validation and derivation) or —
+    /// for contract callers — via the returned handles directly. Same
+    /// public checks per op as `requestOp`; same deferred binding, one
+    /// `fulfillBatch` posts every commitment.
+    function requestBatch(SymbolicOp[] calldata ops) external returns (bytes32[] memory results) {
+        uint256 n = ops.length;
+        if (n == 0) revert EmptyBatch();
+        if (n > MAX_BATCH_OPS) revert BatchTooLarge(n);
+        results = new bytes32[](n);
+        uint64 id = nextRequestId;
+        for (uint256 i = 0; i < n; i++) {
+            bytes32 lhs = _resolveRef(ops[i].lhs, results, i);
+            bytes32 rhs = _resolveRef(ops[i].rhs, results, i);
+            bytes32 cond = _resolveRef(ops[i].cond, results, i);
+            uint8 typeTag = _validateOp(ops[i].op, lhs, rhs, cond);
+            bytes32 result = _symbolicHandle(ops[i].op, lhs, rhs, cond, id, uint32(i), typeTag);
+            results[i] = result;
+            symbolicType[result] = typeTag + 1;
+            _allow(result, msg.sender);
+        }
+        _request(OP_BATCH, abi.encode(msg.sender, ops, results));
+        emit BatchRequested(id, msg.sender, ops, results);
+    }
+
+    /// @notice The intra-batch reference marker for the result of op
+    /// `index` (only earlier ops resolve; see `requestBatch`).
+    function batchRef(uint256 index) public pure returns (bytes32) {
+        return bytes32(REF_PREFIX) | bytes32(uint256(uint64(index)));
     }
 
     /// @notice Grants `account` read (decryption) access to `handle` —
@@ -572,6 +633,26 @@ contract ConfidentialTokenGateway {
         emit OpFulfilled(id, result);
     }
 
+    /// @notice Fulfills an atomic batch: several results' deferred
+    /// commitments posted in ONE transaction (the fulfillment-side gas
+    /// amortization), bound to the one batch request.
+    function fulfillBatch(
+        uint64 id,
+        address caller,
+        SymbolicOp[] calldata ops,
+        bytes32[] calldata results,
+        bytes32[] calldata commitments
+    ) external onlyCoprocessor {
+        if (results.length != ops.length || commitments.length != ops.length) {
+            revert BatchShapeMismatch(id);
+        }
+        _fulfill(id, OP_BATCH, keccak256(abi.encode(caller, ops, results)));
+        for (uint256 i = 0; i < results.length; i++) {
+            handleCommitment[results[i]] = commitments[i];
+        }
+        emit BatchFulfilled(id);
+    }
+
     // ------------------------------------------------------------------
     // Internals.
     // ------------------------------------------------------------------
@@ -609,6 +690,20 @@ contract ConfidentialTokenGateway {
         uint8 tagged = symbolicType[handle];
         uint8 actual = tagged == 0 ? TYPE_EUINT64 : tagged - 1;
         if (actual != wantType) revert WrongOperandType(handle);
+    }
+
+    /// @dev Resolves a `batchRef` marker against the results derived so
+    /// far; non-markers pass through. Only strictly earlier ops are
+    /// resolvable — execution is in op order.
+    function _resolveRef(bytes32 handle, bytes32[] memory results, uint256 current)
+        internal
+        pure
+        returns (bytes32)
+    {
+        if (bytes24(handle) != REF_PREFIX) return handle;
+        uint256 index = uint256(handle) & type(uint64).max;
+        if (index >= current) revert RefOutOfRange(handle, current);
+        return results[index];
     }
 
     /// @dev The symbolic result handle: keccak over a domain tag, the

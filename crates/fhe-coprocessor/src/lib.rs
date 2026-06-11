@@ -51,7 +51,7 @@ mod requests;
 pub use client::Client;
 pub use coprocessor::{Coprocessor, op_result_type, symbolic_handle};
 pub use operator::{Operator, OperatorHandle, OperatorState};
-pub use requests::{ops, types};
+pub use requests::{OpSpec, ops, types};
 
 /// Errors of the coprocessor crate.
 #[derive(Debug, thiserror::Error)]

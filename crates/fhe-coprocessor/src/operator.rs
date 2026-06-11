@@ -387,6 +387,19 @@ async fn send_fulfillment(
             result,
             commitment,
         } => send!(gateway.fulfillOp(id, caller, op, lhs, rhs, cond, result, commitment)),
+        Fulfillment::Batch {
+            id,
+            caller,
+            ref ops,
+            ref results,
+            ref commitments,
+        } => send!(gateway.fulfillBatch(
+            id,
+            caller,
+            ops.iter().map(Into::into).collect(),
+            results.clone(),
+            commitments.clone(),
+        )),
         Fulfillment::Unwrap {
             id,
             account,

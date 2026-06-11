@@ -14,6 +14,14 @@ sol! {
     #[sol(rpc)]
     #[derive(Debug)]
     interface IConfidentialTokenGateway {
+        /// One op of an atomic symbolic batch.
+        struct SymbolicOp {
+            uint8 op;
+            bytes32 lhs;
+            bytes32 rhs;
+            bytes32 cond;
+        }
+
         function agent() external view returns (address);
         function coprocessor() external view returns (address);
         function nextRequestId() external view returns (uint64);
@@ -44,6 +52,8 @@ sol! {
         function unwrap(bytes32 amountHandle) external;
         function allow(bytes32 handle, address account) external;
         function requestOp(uint8 op, bytes32 lhs, bytes32 rhs, bytes32 cond) external returns (bytes32 result);
+        function requestBatch(SymbolicOp[] calldata ops) external returns (bytes32[] memory results);
+        function batchRef(uint256 index) external pure returns (bytes32);
 
         function registerInput(bytes32 handle, bytes32 commitment, address owner) external;
         function fulfillAck(uint64 id) external;
@@ -93,6 +103,13 @@ sol! {
             bytes32 cond,
             bytes32 result,
             bytes32 commitment
+        ) external;
+        function fulfillBatch(
+            uint64 id,
+            address caller,
+            SymbolicOp[] calldata ops,
+            bytes32[] calldata results,
+            bytes32[] calldata commitments
         ) external;
         function fulfillUnwrap(
             uint64 id,
@@ -167,11 +184,17 @@ sol! {
         error OutOfOrderFulfillment(uint64 id, uint64 expected);
         error RequestMismatch(uint64 id);
         error HandleAlreadyAnchored(bytes32 handle);
+        event BatchRequested(uint64 indexed id, address indexed caller, SymbolicOp[] ops, bytes32[] results);
         event OpFulfilled(uint64 indexed id, bytes32 indexed result);
+        event BatchFulfilled(uint64 indexed id);
 
         error NotAllowed(bytes32 handle, address account);
         error UnknownOp(uint8 op);
         error WrongArity(uint8 op);
         error WrongOperandType(bytes32 handle);
+        error EmptyBatch();
+        error BatchTooLarge(uint256 size);
+        error RefOutOfRange(bytes32 handle, uint256 resolvableBelow);
+        error BatchShapeMismatch(uint64 id);
     }
 }

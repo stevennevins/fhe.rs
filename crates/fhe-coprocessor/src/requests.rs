@@ -30,6 +30,80 @@ pub mod types {
     pub const EUINT64: u8 = 5;
 }
 
+/// One op of an atomic symbolic batch, mirroring the contract's
+/// `SymbolicOp` struct. Build with the constructors; reference an
+/// earlier op's result in the same batch with [`OpSpec::result_of`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpSpec {
+    /// The op tag ([`ops`]).
+    pub op: u8,
+    /// Left operand (a handle or an intra-batch reference).
+    pub lhs: B256,
+    /// Right operand (a handle or an intra-batch reference).
+    pub rhs: B256,
+    /// Select condition (zero for two-operand ops).
+    pub cond: B256,
+}
+
+impl OpSpec {
+    /// `lhs + rhs`.
+    #[must_use]
+    pub fn add(lhs: B256, rhs: B256) -> Self {
+        Self {
+            op: ops::ADD,
+            lhs,
+            rhs,
+            cond: B256::ZERO,
+        }
+    }
+
+    /// `lhs - rhs`.
+    #[must_use]
+    pub fn sub(lhs: B256, rhs: B256) -> Self {
+        Self {
+            op: ops::SUB,
+            lhs,
+            rhs,
+            cond: B256::ZERO,
+        }
+    }
+
+    /// `lhs >= rhs` (operands below 2^40, the committee bound).
+    #[must_use]
+    pub fn ge(lhs: B256, rhs: B256) -> Self {
+        Self {
+            op: ops::GE,
+            lhs,
+            rhs,
+            cond: B256::ZERO,
+        }
+    }
+
+    /// `cond ? lhs : rhs`.
+    #[must_use]
+    pub fn select(cond: B256, lhs: B256, rhs: B256) -> Self {
+        Self {
+            op: ops::SELECT,
+            lhs,
+            rhs,
+            cond,
+        }
+    }
+
+    /// The intra-batch reference marker for the result of op `index`
+    /// (the contract's `batchRef`): result handles embed the request
+    /// id, so an off-chain builder cannot name them in advance — only
+    /// strictly earlier ops resolve.
+    #[must_use]
+    pub fn result_of(index: u64) -> B256 {
+        let prefix = alloy::primitives::keccak256(b"fhe.rs/ref");
+        let mut marker = B256::ZERO;
+        marker.0[..24].copy_from_slice(&prefix.0[..24]);
+        marker.0[24..].copy_from_slice(&index.to_be_bytes());
+        marker
+    }
+}
+
 /// A decoded request event, in the order its id assigns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -154,6 +228,20 @@ pub enum Request {
         /// The contract-derived symbolic result handle.
         result: B256,
     },
+    /// An atomic ordered batch of symbolic ops: one request id, one
+    /// fulfillment, intra-batch references already meaningful (the
+    /// result handles were all derived on-chain at request time).
+    Batch {
+        /// Request id.
+        id: u64,
+        /// The requesting caller.
+        caller: Address,
+        /// The ops, in execution order, as submitted (markers
+        /// unresolved — resolution is deterministic on both sides).
+        ops: Vec<OpSpec>,
+        /// The contract-derived result handles, one per op.
+        results: Vec<B256>,
+    },
     /// ACL grant (already authorized and written on-chain; mirrored
     /// into the coprocessor's read path in request order).
     Allow {
@@ -183,6 +271,7 @@ impl Request {
             | Self::Recover { id, .. }
             | Self::Unwrap { id, .. }
             | Self::SymbolicOp { id, .. }
+            | Self::Batch { id, .. }
             | Self::Allow { id, .. } => *id,
         }
     }
@@ -282,6 +371,14 @@ impl Request {
                 cond: e.cond,
                 result: e.result,
             }
+        } else if *topic == gw::BatchRequested::SIGNATURE_HASH {
+            let e = decode::<gw::BatchRequested>(log)?;
+            Self::Batch {
+                id: e.id,
+                caller: e.caller,
+                ops: e.ops.iter().map(OpSpec::from).collect(),
+                results: e.results,
+            }
         } else if *topic == gw::AllowRequested::SIGNATURE_HASH {
             let e = decode::<gw::AllowRequested>(log)?;
             Self::Allow {
@@ -298,6 +395,28 @@ impl Request {
 
 fn decode<E: SolEvent>(log: &Log) -> Result<E> {
     Ok(log.log_decode::<E>().map_err(chain_err)?.inner.data)
+}
+
+impl From<&gw::SymbolicOp> for OpSpec {
+    fn from(op: &gw::SymbolicOp) -> Self {
+        Self {
+            op: op.op,
+            lhs: op.lhs,
+            rhs: op.rhs,
+            cond: op.cond,
+        }
+    }
+}
+
+impl From<&OpSpec> for gw::SymbolicOp {
+    fn from(spec: &OpSpec) -> Self {
+        Self {
+            op: spec.op,
+            lhs: spec.lhs,
+            rhs: spec.rhs,
+            cond: spec.cond,
+        }
+    }
 }
 
 /// A fresh on-chain handle plus the keccak256 commitment to the
@@ -395,6 +514,20 @@ pub enum Fulfillment {
         /// binding posted at fulfillment.
         commitment: B256,
     },
+    /// A batch materialized: every result's deferred commitment, posted
+    /// in one transaction.
+    Batch {
+        /// Request id.
+        id: u64,
+        /// The requesting caller (echoed for the request binding).
+        caller: Address,
+        /// The ops as submitted (echoed for the request binding).
+        ops: Vec<OpSpec>,
+        /// The result handles (echoed for the request binding).
+        results: Vec<B256>,
+        /// One commitment per result — the deferred bindings.
+        commitments: Vec<B256>,
+    },
     /// An unwrap landed (successfully or not — both are public).
     Unwrap {
         /// Request id.
@@ -424,6 +557,7 @@ impl Fulfillment {
             | Self::FrozenSet { id, .. }
             | Self::Recover { id, .. }
             | Self::Op { id, .. }
+            | Self::Batch { id, .. }
             | Self::Unwrap { id, .. } => *id,
         }
     }

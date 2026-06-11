@@ -66,6 +66,30 @@ pub fn op_result_type(op: u8) -> u8 {
     }
 }
 
+/// Resolves an intra-batch `batchRef` marker against the results
+/// derived so far, exactly as the contract does; non-markers pass
+/// through. Only strictly earlier ops resolve.
+fn resolve_ref(handle: B256, results: &[B256], current: usize) -> Result<B256> {
+    let prefix = keccak256(b"fhe.rs/ref");
+    if handle.0[..24] != prefix.0[..24] {
+        return Ok(handle);
+    }
+    let mut index_bytes = [0u8; 8];
+    index_bytes.copy_from_slice(&handle.0[24..]);
+    let index = usize::try_from(u64::from_be_bytes(index_bytes))
+        .map_err(|_| Error::State(format!("batch ref {handle} index overflows")))?;
+    if index >= current {
+        return Err(Error::State(format!(
+            "batch ref {handle} points at op {index}, not strictly earlier than {current}"
+        )));
+    }
+    results.get(index).copied().ok_or_else(|| {
+        Error::State(format!(
+            "batch ref {handle} points outside the batch ({index})"
+        ))
+    })
+}
+
 /// A ciphertext the coprocessor stores on behalf of the chain: the
 /// serialized bytes and the keccak256 commitment anchored on-chain.
 struct StoredCiphertext {
@@ -570,6 +594,57 @@ impl Coprocessor {
                     cond,
                     result,
                     commitment,
+                })
+            }
+            Request::Batch {
+                id,
+                caller,
+                ref ops,
+                ref results,
+            } => {
+                if results.len() != ops.len() {
+                    return Err(Error::State(format!(
+                        "request {id}: batch shape mismatch ({} ops, {} results)",
+                        ops.len(),
+                        results.len()
+                    )));
+                }
+                let mut commitments = Vec::with_capacity(ops.len());
+                for (i, (spec, &result)) in ops.iter().zip(results.iter()).enumerate() {
+                    let lhs = resolve_ref(spec.lhs, results, i)?;
+                    let rhs = resolve_ref(spec.rhs, results, i)?;
+                    let cond = resolve_ref(spec.cond, results, i)?;
+                    let index = u32::try_from(i)
+                        .map_err(|_| Error::State(format!("batch op index {i} overflows")))?;
+                    let derived = symbolic_handle(
+                        spec.op,
+                        lhs,
+                        rhs,
+                        cond,
+                        id,
+                        index,
+                        op_result_type(spec.op),
+                    );
+                    if derived != result {
+                        return Err(Error::State(format!(
+                            "request {id}, op {i}: symbolic handle mismatch \
+                             (chain {result}, derived {derived})"
+                        )));
+                    }
+                    let output = self.execute_symbolic(spec.op, lhs, rhs, cond)?;
+                    let bytes = output.to_bytes();
+                    let commitment = keccak256(&bytes);
+                    self.store
+                        .insert(result, StoredCiphertext { bytes, commitment });
+                    self.allow_mirror(result, caller);
+                    commitments.push(commitment);
+                }
+                Ok(Fulfillment::Batch {
+                    id,
+                    caller,
+                    ops: ops.clone(),
+                    results: results.clone(),
+                    commitments,
                 })
             }
             // Already authorized and written on-chain (chain of custody

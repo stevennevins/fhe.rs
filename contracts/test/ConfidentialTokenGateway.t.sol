@@ -304,6 +304,114 @@ contract ConfidentialTokenGatewayTest {
         require(gateway.lastFulfilledId() == selectId, "both fulfilled in order");
     }
 
+    // ------------------------------------------------------------------
+    // Atomic batches (Goal H3): indexed derivation, intra-batch refs,
+    // one fulfillment.
+    // ------------------------------------------------------------------
+
+    function _twoInputs() internal returns (bytes32 x, bytes32 y) {
+        x = keccak256("x");
+        y = keccak256("y");
+        _registerInput(x, ALICE);
+        _registerInput(y, ALICE);
+    }
+
+    function testBatchDerivesIndexedHandlesAndResolvesRefs() public {
+        (bytes32 x, bytes32 y) = _twoInputs();
+        ConfidentialTokenGateway.SymbolicOp[] memory ops = new ConfidentialTokenGateway.SymbolicOp[](3);
+        ops[0] = ConfidentialTokenGateway.SymbolicOp(SOP_GE, x, y, bytes32(0));
+        ops[1] = ConfidentialTokenGateway.SymbolicOp(SOP_SELECT, x, y, gateway.batchRef(0));
+        ops[2] = ConfidentialTokenGateway.SymbolicOp(SOP_ADD, gateway.batchRef(1), y, bytes32(0));
+        uint64 id = gateway.nextRequestId();
+        vm.prank(ALICE);
+        bytes32[] memory results = gateway.requestBatch(ops);
+        // Derivation: refs resolve to the earlier RESULT handles before
+        // hashing, and the op index separates handles within the batch.
+        require(
+            results[0] == _expectedSymbolicHandle(SOP_GE, x, y, bytes32(0), id, 0, TYPE_EBOOL),
+            "op 0 derivation"
+        );
+        require(
+            results[1] == _expectedSymbolicHandle(SOP_SELECT, x, y, results[0], id, 1, 5),
+            "op 1 derivation resolves the ref"
+        );
+        require(
+            results[2] == _expectedSymbolicHandle(SOP_ADD, results[1], y, bytes32(0), id, 2, 5),
+            "op 2 derivation resolves the ref"
+        );
+        for (uint256 i = 0; i < 3; i++) {
+            require(gateway.isAllowed(results[i], ALICE), "caller allowed on every result");
+            require(gateway.handleCommitment(results[i]) == bytes32(0), "commitments deferred");
+        }
+        require(gateway.nextRequestId() == id + 1, "ONE request id for the whole batch");
+    }
+
+    function testBatchRefsMustPointStrictlyBackwards() public {
+        (bytes32 x, bytes32 y) = _twoInputs();
+        ConfidentialTokenGateway.SymbolicOp[] memory ops = new ConfidentialTokenGateway.SymbolicOp[](1);
+        // A self-reference (index 0 in op 0) cannot resolve.
+        ops[0] = ConfidentialTokenGateway.SymbolicOp(SOP_ADD, gateway.batchRef(0), y, bytes32(0));
+        bytes32 selfRef = gateway.batchRef(0);
+        vm.prank(ALICE);
+        vm.expectRevert(
+            abi.encodeWithSelector(ConfidentialTokenGateway.RefOutOfRange.selector, selfRef, 0)
+        );
+        gateway.requestBatch(ops);
+        // Type checks see through refs: an ebool result is not a
+        // euint64 operand even via a marker.
+        ConfidentialTokenGateway.SymbolicOp[] memory typed = new ConfidentialTokenGateway.SymbolicOp[](2);
+        typed[0] = ConfidentialTokenGateway.SymbolicOp(SOP_GE, x, y, bytes32(0));
+        typed[1] = ConfidentialTokenGateway.SymbolicOp(SOP_ADD, gateway.batchRef(0), y, bytes32(0));
+        vm.prank(ALICE);
+        vm.expectRevert();
+        gateway.requestBatch(typed);
+    }
+
+    function testBatchSizeBoundsArePinned() public {
+        (bytes32 x, bytes32 y) = _twoInputs();
+        ConfidentialTokenGateway.SymbolicOp[] memory empty = new ConfidentialTokenGateway.SymbolicOp[](0);
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.EmptyBatch.selector));
+        gateway.requestBatch(empty);
+
+        uint256 over = gateway.MAX_BATCH_OPS() + 1;
+        ConfidentialTokenGateway.SymbolicOp[] memory tooLarge = new ConfidentialTokenGateway.SymbolicOp[](over);
+        for (uint256 i = 0; i < over; i++) {
+            tooLarge[i] = ConfidentialTokenGateway.SymbolicOp(SOP_ADD, x, y, bytes32(0));
+        }
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.BatchTooLarge.selector, over));
+        gateway.requestBatch(tooLarge);
+    }
+
+    function testFulfillBatchPostsEveryCommitmentInOneTransaction() public {
+        (bytes32 x, bytes32 y) = _twoInputs();
+        ConfidentialTokenGateway.SymbolicOp[] memory ops = new ConfidentialTokenGateway.SymbolicOp[](2);
+        ops[0] = ConfidentialTokenGateway.SymbolicOp(SOP_GE, x, y, bytes32(0));
+        ops[1] = ConfidentialTokenGateway.SymbolicOp(SOP_SELECT, x, y, gateway.batchRef(0));
+        uint64 id = gateway.nextRequestId();
+        vm.prank(ALICE);
+        bytes32[] memory results = gateway.requestBatch(ops);
+
+        bytes32[] memory commitments = new bytes32[](2);
+        commitments[0] = bytes32(uint256(11));
+        commitments[1] = bytes32(uint256(22));
+        // Shape and payload binding are enforced.
+        bytes32[] memory short = new bytes32[](1);
+        vm.prank(COPROCESSOR);
+        vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.BatchShapeMismatch.selector, id));
+        gateway.fulfillBatch(id, ALICE, ops, results, short);
+        vm.prank(COPROCESSOR);
+        vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.RequestMismatch.selector, id));
+        gateway.fulfillBatch(id, BOB, ops, results, commitments);
+        // One transaction posts both deferred bindings.
+        vm.prank(COPROCESSOR);
+        gateway.fulfillBatch(id, ALICE, ops, results, commitments);
+        require(gateway.handleCommitment(results[0]) == commitments[0], "first binding");
+        require(gateway.handleCommitment(results[1]) == commitments[1], "second binding");
+        require(gateway.lastFulfilledId() == id, "one fulfillment for the batch");
+    }
+
     function testRolesAreSetAtDeploy() public view {
         require(gateway.agent() == AGENT, "agent");
         require(gateway.coprocessor() == COPROCESSOR, "coprocessor");
