@@ -59,6 +59,15 @@ alice.transfer(bob_address, input).await?;     // resolves on fulfillment
 let balance = alice.balance(alice_address).await?;  // ACL-checked decrypt
 ```
 
+For building ON the kit rather than just using the token, `Client`
+also exposes the composability surface (see "Composability" below):
+`allow(handle, account)`, the symbolic ops
+(`add`/`sub`/`ge`/`select`/`request_op`), atomic `batch(&[OpSpec])`,
+and the generic ACL-checked `decrypt(handle)`.
+`crates/fhe-coprocessor/examples/auction.rs` drives the worked
+third-party contract (`contracts/src/examples/SealedBidAuction.sol`)
+end to end.
+
 ### fhEVM concept mapping
 
 | fhEVM concept | This kit |
@@ -68,10 +77,10 @@ let balance = alice.balance(alice_address).await?;  // ACL-checked decrypt
 | input proof (`input.inputProof`) | **deliberately absent** — TODO-by-trust-model: the coprocessor validates inputs against the deployment parameters when it registers them, and v1 trusts it as executor; a ZK proof of plaintext knowledge is future work |
 | `confidentialTransfer(to, handle, proof)` | `client.transfer(to, input)` (contract entry point `confidentialTransfer(to, amountHandle)`) |
 | `confidentialBalanceOf(account)` (returns an `euint64` handle) | the contract's `confidentialBalanceOf(account)` (returns the `bytes32` handle) |
-| ACL allow (`FHE.allow(...)`) | ownership and observer grants accumulated from on-chain transactions; enforced by the coprocessor's read path |
+| ACL allow (`FHE.allow(...)`) | the contract's `allow(handle, account)` / `isAllowed(handle, account)` — public on-chain state written at every handle creation (ownership, observer grants) and extended by transaction with fhEVM's chain-of-custody rule; the coprocessor's read path enforces a mirror of exactly this state |
 | user decryption (`fhevm.userDecrypt(...)`) | `client.balance(account)` / `client.frozen(account)` — threshold-decrypts through the ACL, errors cleanly when not granted |
 | decryption oracle callback | the request/fulfillment cycle: every entry point emits a request event; the operator posts one bound fulfillment transaction per request, in order |
-| symbolic execution on ciphertext handles | none — each request maps to one `fhe::token` operation executed by the coprocessor |
+| symbolic execution on ciphertext handles | `requestOp` / `requestBatch` over a SMALL FIXED alphabet (`add`, `sub`, `ge`, `select`): result handles are derived on-chain before the ciphertext exists, so calls chain immediately; the coprocessor materializes them in request order (see "Composability" below) |
 | KMS / threshold network | the in-process N-of-N `fhe::gateway::Committee` (networked MPC is a named future goal) |
 
 ## Public checks stay public
@@ -160,11 +169,117 @@ Known v1 scope cuts, also deliberate:
 - The committee is in-process (`fhe::gateway::Committee`); networked MPC
   between separate committee processes is its own future goal.
 - The decryption read path is an off-chain call
-  (`Coprocessor::decrypt_for`) whose ACL is driven by on-chain state:
-  ownership and observer grants accumulated from on-chain transactions
-  decide who a handle decrypts for (tested: a read permission granted by
-  an on-chain transaction is the one the coprocessor enforces, and a
-  never-granted account is denied on every handle).
+  (`Coprocessor::decrypt_for`) whose ACL **is** the on-chain state: the
+  contract's `isAllowed` mapping, written at every handle creation and
+  by `allow` transactions, is mirrored into the coprocessor in request
+  order and is the only authorization source the read path consults
+  (tested: a read permission granted by an on-chain transaction is the
+  one the coprocessor enforces, and a never-granted account is denied
+  on every handle).
+
+## Composability: the on-chain ACL and symbolic ops (Goal H)
+
+Goals F/G made the kit easy to USE; this layer makes it possible to
+BUILD ON: third-party encrypted logic without coprocessor changes,
+atomic multi-step operations, cross-contract use of encrypted state,
+and latency hiding (the request transaction confirms at chain speed;
+the FHE compute pipelines behind it). `SealedBidAuction.sol` is the
+worked proof: an auction settled over encrypted bids using ONLY
+`allow`, `isAllowed`, and `requestBatch` — zero coprocessor code, zero
+new gateway entry points.
+
+### The on-chain ACL
+
+`isAllowed(handle, account)` is public contract state. The contract
+writes it at every handle creation — `registerInput` allows the owner;
+balance rotations allow the account (plus the observer the request
+saw); transfers allow both parties on the transferred amount; frozen
+handles allow the account and the freezer; force transfers grant no
+observers — and `allow(handle, account)` extends it with fhEVM's
+chain-of-custody rule: only a caller already allowed on a handle may
+grant further access. Observer grants use a snapshot taken at REQUEST
+time, because the coprocessor mirrors observer state in request order
+and `observerOf` can change between request and fulfillment.
+
+`allow` rides the request/ack cycle like the other mirrored policy
+state, so when a `Client::allow` call resolves, the grant is live in
+the coprocessor's read path. Divergence from fhEVM, named: the ACL is
+a gateway extension, not a separate ACL contract — the coprocessor
+replays exactly one contract's event stream, and v1 gains nothing from
+a second deployment. There is no `allowTransient` and no
+`makePubliclyDecryptable`; grants are permanent and revocation does
+not exist (matching the kit's "no retroactive revocation" observer
+semantics).
+
+### The two handle kinds, and how a reader tells them apart
+
+1. **Anchor-at-mint handles** (encrypted inputs, token fulfillment
+   outputs): opaque keccak values minted by the coprocessor, whose
+   `handleCommitment` is posted in the SAME transaction that
+   introduces them. These keep their Goal F derivation, unchanged.
+2. **Symbolic result handles** (`requestOp`/`requestBatch` results):
+   derived ON-CHAIN before the ciphertext exists, as
+   `keccak256("fhe.rs/sym" ‖ op ‖ lhs ‖ rhs ‖ cond ‖ requestId ‖ opIndex)`
+   with fhEVM-style trailing bytes written in — byte 21 = `0xff` (the
+   FhevmHandle computed marker), byte 30 = the type tag (`ebool` = 0,
+   `euint64` = 5), byte 31 = the version (0).
+
+A reader distinguishes them by the trailing structure (an
+anchor-at-mint handle has random trailing bytes; matching the marker,
+tag, and version by chance is ~2^-24) — but the CONTRACT never does:
+operand types come from a storage mapping written at derivation time,
+never parsed out of handle bytes, so a 1-in-256 collision cannot
+confuse consensus.
+
+### The deferred-binding weakening, named
+
+An anchor-at-mint handle is hash-bound to its ciphertext from the
+moment the chain learns it. A symbolic handle is a PROMISE: its
+`handleCommitment` is zero until the coprocessor's fulfillment posts
+it. Between request and fulfillment the binding rests entirely on the
+fulfillment transaction being coprocessor-signed — the chain cannot
+detect a coprocessor that materializes a wrong ciphertext, only one
+that breaks request order or the request hash. This is a real
+weakening relative to Goal F's anchor-at-mint, accepted as the price
+of chaining (callers compose on results that do not exist yet), and it
+does not change WHO is trusted: the same v1 trusted executor, with the
+same censor/stall powers, now also promises future ciphertexts.
+
+### Symbolic ops and atomic batches
+
+The alphabet is `add`, `sub`, `ge`, `select` — the smallest set that
+expresses a guarded transfer, and its smallness is a feature (every op
+is tested with reference and leakage assertions; there is no general
+VM). Public checks revert in the contract: unknown op, wrong arity,
+wrong operand type, an operand the caller is not allowed on (which
+doubles as the existence check — every real handle has at least one
+grant). Encrypted semantics never revert: a `select` over a failed
+`ge` fulfills with the same shape as a successful one. `ge` operands
+must be below 2^40 (the committee's comparison bound) — like the
+kit's safe-math domain, a documented precondition on encrypted values
+that cannot be checked. `ge` runs the committee's blinded-difference
+comparison; its transcripts land in `Coprocessor::op_compares` and the
+e2e sweeps them with the Goal D single-party-view assertions,
+compositions included.
+
+`requestBatch` carries an ordered op list — one request id, one
+`fulfillBatch` posting every commitment (measured: both the request
+and fulfillment sides cost roughly half the sequential gas at 8 ops).
+Later ops reference earlier results positionally via `batchRef(i)`
+markers, because result handles embed the request id, which an
+off-chain builder cannot know; a contract calling `requestBatch` gets
+the real handles back synchronously and may use either form. Batches
+are bounded at `MAX_BATCH_OPS = 32` (pinned by a forge test) so
+request and fulfillment gas stay predictable.
+
+### Still deliberately absent
+
+- **Input proofs** — unchanged TODO-by-trust-model from Goal F.
+- **A networked committee** — the N-of-N stays in-process.
+- **Arbitrary-contract FHE** — the alphabet is fixed and small; there
+  is no bytecode-driven symbolic executor, no `allowTransient`, no
+  public decryption. Each would change the trust or leakage story and
+  is out of scope by design.
 
 ## What runs where, per entry point
 
@@ -179,6 +294,8 @@ Known v1 scope cuts, also deliberate:
 | `forceConfidentialTransferFrom` | agent role | core-circuit transfer (balance guard only; unlike OZ, moves frozen funds too — see below) |
 | `recover` | agent role | full-balance move, frozen carried as encrypted `min` |
 | `unwrap` | input ownership | threshold-decrypts the amount (by design), credits `publicBalance` on success via the fulfillment |
+| `allow` | chain of custody (caller must be allowed on the handle); takes effect on-chain | mirrors the grant into the read path |
+| `requestOp` / `requestBatch` | op known, arity, operand types, caller allowed on every operand; derives the result handle(s) | executes the op(s) in request order, posts the deferred commitment(s) |
 
 ### Divergences from OZ ERC7984, named
 

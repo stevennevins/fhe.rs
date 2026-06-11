@@ -61,6 +61,12 @@ contract ConfidentialTokenGateway {
     /// @notice Owner of each anchored encrypted input handle.
     mapping(bytes32 => address) public inputOwner;
 
+    /// @notice The on-chain ACL, in the fhEVM shape: which accounts may
+    /// read (decrypt) the ciphertext behind each handle. Written by the
+    /// contract at every handle creation and extended by `allow`; the
+    /// coprocessor's decryption read path enforces exactly this state.
+    mapping(bytes32 => mapping(address => bool)) public isAllowed;
+
     /// @notice Whether transfers are paused (agent-set, public).
     bool public paused;
     /// @notice Blocklist (agent-set, public).
@@ -73,8 +79,16 @@ contract ConfidentialTokenGateway {
     mapping(address => address) public observerOf;
 
     /// @dev Request binding: op tag and payload hash per pending id.
-    mapping(uint64 => uint8) public requestOp;
+    mapping(uint64 => uint8) public requestOpTag;
     mapping(uint64 => bytes32) public requestHash;
+
+    /// @dev Observer snapshots taken at REQUEST time for wraps and
+    /// transfers, so the ACL grants written at fulfillment reflect the
+    /// observer state the request saw — the coprocessor processes
+    /// requests in id order and mirrors exactly that state. Cleared at
+    /// fulfillment.
+    mapping(uint64 => address) private requestObserverFrom;
+    mapping(uint64 => address) private requestObserverTo;
 
     uint8 public constant OP_FAUCET = 1;
     uint8 public constant OP_WRAP = 2;
@@ -87,6 +101,55 @@ contract ConfidentialTokenGateway {
     uint8 public constant OP_FORCE_TRANSFER = 9;
     uint8 public constant OP_RECOVER = 10;
     uint8 public constant OP_UNWRAP = 11;
+    uint8 public constant OP_ALLOW = 12;
+    uint8 public constant OP_SYMBOLIC = 13;
+    uint8 public constant OP_BATCH = 14;
+
+    // ------------------------------------------------------------------
+    // Symbolic encrypted ops (Goal H2): a small fixed alphabet over
+    // ACL-allowed handles, with the RESULT handle derived on-chain
+    // before its ciphertext exists. The handle is a promise: its
+    // `handleCommitment` is posted at fulfillment (deferred binding —
+    // a documented weakening of anchor-at-mint, see the docs).
+    // ------------------------------------------------------------------
+    uint8 public constant SOP_ADD = 1;
+    uint8 public constant SOP_SUB = 2;
+    uint8 public constant SOP_GE = 3;
+    uint8 public constant SOP_SELECT = 4;
+
+    /// @notice fhEVM-style type tags carried in a symbolic handle's
+    /// byte 30 (`ebool` = 0, `euint64` = 5, as in FhevmHandle).
+    uint8 public constant TYPE_EBOOL = 0;
+    uint8 public constant TYPE_EUINT64 = 5;
+    /// @notice Symbolic handle version, carried in byte 31.
+    uint8 public constant HANDLE_VERSION = 0;
+
+    /// @dev Type tag + 1 per symbolic result handle (0 = not symbolic).
+    /// The deterministic type source for operand checks; the trailing
+    /// bytes of the handle mirror it for off-chain readers. Anchored
+    /// inputs and fulfillment outputs are euint64 by construction.
+    mapping(bytes32 => uint8) private symbolicType;
+
+    /// @notice One op of an atomic batch. Operands may be real handles
+    /// or `batchRef(i)` markers referencing the result of an EARLIER op
+    /// in the same batch (result handles embed the request id, so an
+    /// off-chain builder cannot know them in advance; a contract caller
+    /// gets the real handles back from `requestBatch` synchronously).
+    struct SymbolicOp {
+        uint8 op;
+        bytes32 lhs;
+        bytes32 rhs;
+        bytes32 cond;
+    }
+
+    /// @notice Hard batch-size bound, pinned by a forge test: bounded
+    /// loops keep request and fulfillment gas predictable. A documented
+    /// limit, not an implicit one.
+    uint256 public constant MAX_BATCH_OPS = 32;
+
+    /// @dev Intra-batch reference marker prefix (first 24 bytes of
+    /// keccak256("fhe.rs/ref")); the low 8 bytes carry the op index.
+    bytes24 internal constant REF_PREFIX = bytes24(keccak256("fhe.rs/ref"));
 
     // ------------------------------------------------------------------
     // Request events (decoded by the coprocessor, processed in id order).
@@ -102,9 +165,24 @@ contract ConfidentialTokenGateway {
     event ForceTransferRequested(uint64 indexed id, address indexed from, address indexed to, bytes32 amountHandle);
     event RecoverRequested(uint64 indexed id, address indexed lost, address indexed recipient);
     event UnwrapRequested(uint64 indexed id, address indexed account, bytes32 amountHandle);
+    event AllowRequested(uint64 indexed id, bytes32 indexed handle, address indexed account);
+    event OpRequested(
+        uint64 indexed id,
+        address indexed caller,
+        uint8 op,
+        bytes32 lhs,
+        bytes32 rhs,
+        bytes32 cond,
+        bytes32 result
+    );
+    event BatchRequested(uint64 indexed id, address indexed caller, SymbolicOp[] ops, bytes32[] results);
 
     /// @notice An encrypted input was anchored by the coprocessor.
     event InputRegistered(bytes32 indexed handle, bytes32 commitment, address indexed owner);
+
+    /// @notice `account` may now read (decrypt) the ciphertext behind
+    /// `handle`. Emitted once per (handle, account) grant.
+    event Allowed(bytes32 indexed handle, address indexed account);
 
     // ------------------------------------------------------------------
     // Fulfillment events (the handle rotations the e2e asserts against).
@@ -131,6 +209,8 @@ contract ConfidentialTokenGateway {
     event UnwrapFulfilled(
         uint64 indexed id, address indexed account, uint64 amount, bool success, bytes32 newBalanceHandle
     );
+    event OpFulfilled(uint64 indexed id, bytes32 indexed result);
+    event BatchFulfilled(uint64 indexed id);
 
     error NotAgent();
     error NotCoprocessor();
@@ -144,6 +224,14 @@ contract ConfidentialTokenGateway {
     error OutOfOrderFulfillment(uint64 id, uint64 expected);
     error RequestMismatch(uint64 id);
     error HandleAlreadyAnchored(bytes32 handle);
+    error NotAllowed(bytes32 handle, address account);
+    error UnknownOp(uint8 op);
+    error WrongArity(uint8 op);
+    error WrongOperandType(bytes32 handle);
+    error EmptyBatch();
+    error BatchTooLarge(uint256 size);
+    error RefOutOfRange(bytes32 handle, uint256 resolvableBelow);
+    error BatchShapeMismatch(uint64 id);
 
     modifier onlyAgent() {
         if (msg.sender != agent) revert NotAgent();
@@ -181,6 +269,7 @@ contract ConfidentialTokenGateway {
         if (balance < amount) revert InsufficientPublicBalance(msg.sender, balance, amount);
         publicBalance[msg.sender] = balance - amount;
         uint64 id = _request(OP_WRAP, abi.encode(msg.sender, amount));
+        requestObserverFrom[id] = observerOf[msg.sender];
         emit WrapRequested(id, msg.sender, amount);
     }
 
@@ -196,7 +285,78 @@ contract ConfidentialTokenGateway {
         if (confidentialBalanceOf[msg.sender] == 0) revert NoBalance(msg.sender);
         _requireOwnedInput(amountHandle);
         uint64 id = _request(OP_TRANSFER, abi.encode(msg.sender, to, amountHandle));
+        requestObserverFrom[id] = observerOf[msg.sender];
+        requestObserverTo[id] = observerOf[to];
         emit TransferRequested(id, msg.sender, to, amountHandle);
+    }
+
+    /// @notice Requests one symbolic encrypted operation over handles
+    /// the caller is allowed on, returning the RESULT handle derived
+    /// deterministically here — before the ciphertext exists, so calls
+    /// may chain on it immediately (including within one transaction).
+    /// `cond` is the select condition (an ebool handle) and must be
+    /// zero for the two-operand ops. Encrypted semantics never revert:
+    /// a `select` on a failed `ge` fulfills with the same shape as a
+    /// successful one. Operand bound: `ge` compares values below 2^40
+    /// (the committee's comparison bound), a documented precondition
+    /// on encrypted values that cannot be checked here.
+    function requestOp(uint8 op, bytes32 lhs, bytes32 rhs, bytes32 cond)
+        external
+        returns (bytes32 result)
+    {
+        uint8 typeTag = _validateOp(op, lhs, rhs, cond);
+        uint64 id = nextRequestId;
+        result = _symbolicHandle(op, lhs, rhs, cond, id, 0, typeTag);
+        _request(OP_SYMBOLIC, abi.encode(msg.sender, op, lhs, rhs, cond, result));
+        symbolicType[result] = typeTag + 1;
+        _allow(result, msg.sender);
+        emit OpRequested(id, msg.sender, op, lhs, rhs, cond, result);
+    }
+
+    /// @notice Requests an atomic ordered batch of symbolic ops in one
+    /// transaction: one request id, one fulfillment. Later ops may
+    /// reference earlier results via `batchRef(i)` markers (resolved
+    /// here, deterministically, before validation and derivation) or —
+    /// for contract callers — via the returned handles directly. Same
+    /// public checks per op as `requestOp`; same deferred binding, one
+    /// `fulfillBatch` posts every commitment.
+    function requestBatch(SymbolicOp[] calldata ops) external returns (bytes32[] memory results) {
+        uint256 n = ops.length;
+        if (n == 0) revert EmptyBatch();
+        if (n > MAX_BATCH_OPS) revert BatchTooLarge(n);
+        results = new bytes32[](n);
+        uint64 id = nextRequestId;
+        for (uint256 i = 0; i < n; i++) {
+            bytes32 lhs = _resolveRef(ops[i].lhs, results, i);
+            bytes32 rhs = _resolveRef(ops[i].rhs, results, i);
+            bytes32 cond = _resolveRef(ops[i].cond, results, i);
+            uint8 typeTag = _validateOp(ops[i].op, lhs, rhs, cond);
+            bytes32 result = _symbolicHandle(ops[i].op, lhs, rhs, cond, id, uint32(i), typeTag);
+            results[i] = result;
+            symbolicType[result] = typeTag + 1;
+            _allow(result, msg.sender);
+        }
+        _request(OP_BATCH, abi.encode(msg.sender, ops, results));
+        emit BatchRequested(id, msg.sender, ops, results);
+    }
+
+    /// @notice The intra-batch reference marker for the result of op
+    /// `index` (only earlier ops resolve; see `requestBatch`).
+    function batchRef(uint256 index) public pure returns (bytes32) {
+        return bytes32(REF_PREFIX) | bytes32(uint256(uint64(index)));
+    }
+
+    /// @notice Grants `account` read (decryption) access to `handle` —
+    /// the fhEVM `FHE.allow` shape. Chain of custody: only a caller the
+    /// ACL already allows on the handle may extend it. The grant is
+    /// public state immediately; the request/ack cycle mirrors it into
+    /// the coprocessor's read path in request order, like the rest of
+    /// the policy state.
+    function allow(bytes32 handle, address account) external {
+        if (!isAllowed[handle][msg.sender]) revert NotAllowed(handle, msg.sender);
+        _allow(handle, account);
+        uint64 id = _request(OP_ALLOW, abi.encode(handle, account));
+        emit AllowRequested(id, handle, account);
     }
 
     /// @notice Sets the caller's OWN observer (address 0 removes it).
@@ -308,6 +468,7 @@ contract ConfidentialTokenGateway {
         if (inputOwner[handle] != address(0)) revert HandleAlreadyAnchored(handle);
         inputOwner[handle] = owner;
         handleCommitment[handle] = commitment;
+        _allow(handle, owner);
         emit InputRegistered(handle, commitment, owner);
     }
 
@@ -318,10 +479,10 @@ contract ConfidentialTokenGateway {
         if (id != lastFulfilledId + 1 || id >= nextRequestId) {
             revert OutOfOrderFulfillment(id, lastFulfilledId + 1);
         }
-        uint8 op = requestOp[id];
+        uint8 op = requestOpTag[id];
         require(
             op == OP_FAUCET || op == OP_SET_OBSERVER || op == OP_SET_VERIFIED || op == OP_SET_BLOCKED
-                || op == OP_SET_PAUSED,
+                || op == OP_SET_PAUSED || op == OP_ALLOW,
             "ack only for mirror ops"
         );
         _fulfill(id, op, requestHash[id]);
@@ -339,6 +500,11 @@ contract ConfidentialTokenGateway {
     ) external onlyCoprocessor {
         _fulfill(id, OP_WRAP, keccak256(abi.encode(account, amount)));
         _rotate(account, newBalanceHandle, newBalanceCommitment);
+        // The wrapper's mint grant: the account, plus the observer the
+        // request saw (snapshot, so the mirror agrees in request order).
+        _allow(newBalanceHandle, account);
+        _allowObserver(newBalanceHandle, requestObserverFrom[id]);
+        delete requestObserverFrom[id];
         emit WrapFulfilled(id, account, newBalanceHandle);
     }
 
@@ -358,12 +524,27 @@ contract ConfidentialTokenGateway {
         bytes32 transferredHandle,
         bytes32 transferredCommitment
     ) external onlyCoprocessor {
-        uint8 op = requestOp[id];
+        uint8 op = requestOpTag[id];
         if (op != OP_TRANSFER && op != OP_FORCE_TRANSFER) revert RequestMismatch(id);
         _fulfill(id, op, keccak256(abi.encode(from, to, amountHandle)));
         _rotate(from, newFromHandle, newFromCommitment);
         _rotate(to, newToHandle, newToCommitment);
         handleCommitment[transferredHandle] = transferredCommitment;
+        // Each party reads its own rotated balance; both read the
+        // transferred amount. Observer grants come from the snapshots
+        // the request took — force transfers took none (unobserved).
+        _allow(newFromHandle, from);
+        _allow(newToHandle, to);
+        _allow(transferredHandle, from);
+        _allow(transferredHandle, to);
+        address fromObserver = requestObserverFrom[id];
+        address toObserver = requestObserverTo[id];
+        _allowObserver(newFromHandle, fromObserver);
+        _allowObserver(newToHandle, toObserver);
+        _allowObserver(transferredHandle, fromObserver);
+        _allowObserver(transferredHandle, toObserver);
+        delete requestObserverFrom[id];
+        delete requestObserverTo[id];
         emit TransferFulfilled(id, from, to, newFromHandle, newToHandle, transferredHandle);
     }
 
@@ -378,6 +559,9 @@ contract ConfidentialTokenGateway {
         _fulfill(id, OP_SET_FROZEN, keccak256(abi.encode(account, amountHandle)));
         confidentialFrozen[account] = newFrozenHandle;
         handleCommitment[newFrozenHandle] = newFrozenCommitment;
+        // Frozen amounts read by the account and the freezer (agent).
+        _allow(newFrozenHandle, account);
+        _allow(newFrozenHandle, agent);
         emit FrozenSetFulfilled(id, account, newFrozenHandle);
     }
 
@@ -401,6 +585,10 @@ contract ConfidentialTokenGateway {
         confidentialFrozen[recipient] = newRecipientFrozenHandle;
         handleCommitment[newRecipientFrozenHandle] = newRecipientFrozenCommitment;
         delete confidentialFrozen[lost];
+        _allow(newLostHandle, lost);
+        _allow(newRecipientHandle, recipient);
+        _allow(newRecipientFrozenHandle, recipient);
+        _allow(newRecipientFrozenHandle, agent);
         emit RecoverFulfilled(id, lost, recipient, newLostHandle, newRecipientHandle, newRecipientFrozenHandle);
     }
 
@@ -421,17 +609,129 @@ contract ConfidentialTokenGateway {
         if (success) {
             publicBalance[account] += amount;
             _rotate(account, newBalanceHandle, newBalanceCommitment);
+            _allow(newBalanceHandle, account);
         }
         emit UnwrapFulfilled(id, account, amount, success, newBalanceHandle);
+    }
+
+    /// @notice Fulfills a symbolic op: posts the result handle's
+    /// commitment — the DEFERRED binding. Until this lands, the result
+    /// handle is a coprocessor-signed promise; afterwards it is
+    /// hash-bound exactly like an anchored input.
+    function fulfillOp(
+        uint64 id,
+        address caller,
+        uint8 op,
+        bytes32 lhs,
+        bytes32 rhs,
+        bytes32 cond,
+        bytes32 result,
+        bytes32 commitment
+    ) external onlyCoprocessor {
+        _fulfill(id, OP_SYMBOLIC, keccak256(abi.encode(caller, op, lhs, rhs, cond, result)));
+        handleCommitment[result] = commitment;
+        emit OpFulfilled(id, result);
+    }
+
+    /// @notice Fulfills an atomic batch: several results' deferred
+    /// commitments posted in ONE transaction (the fulfillment-side gas
+    /// amortization), bound to the one batch request.
+    function fulfillBatch(
+        uint64 id,
+        address caller,
+        SymbolicOp[] calldata ops,
+        bytes32[] calldata results,
+        bytes32[] calldata commitments
+    ) external onlyCoprocessor {
+        if (results.length != ops.length || commitments.length != ops.length) {
+            revert BatchShapeMismatch(id);
+        }
+        _fulfill(id, OP_BATCH, keccak256(abi.encode(caller, ops, results)));
+        for (uint256 i = 0; i < results.length; i++) {
+            handleCommitment[results[i]] = commitments[i];
+        }
+        emit BatchFulfilled(id);
     }
 
     // ------------------------------------------------------------------
     // Internals.
     // ------------------------------------------------------------------
 
+    /// @dev Public checks for one symbolic op (these DO revert — they
+    /// are public anyway): known op, right arity, caller allowed on
+    /// every operand, operand types match. Returns the result type.
+    function _validateOp(uint8 op, bytes32 lhs, bytes32 rhs, bytes32 cond)
+        internal
+        view
+        returns (uint8)
+    {
+        if (op == SOP_SELECT) {
+            _requireOperand(cond, TYPE_EBOOL);
+            _requireOperand(lhs, TYPE_EUINT64);
+            _requireOperand(rhs, TYPE_EUINT64);
+            return TYPE_EUINT64;
+        }
+        if (op == SOP_ADD || op == SOP_SUB || op == SOP_GE) {
+            if (cond != bytes32(0)) revert WrongArity(op);
+            _requireOperand(lhs, TYPE_EUINT64);
+            _requireOperand(rhs, TYPE_EUINT64);
+            return op == SOP_GE ? TYPE_EBOOL : TYPE_EUINT64;
+        }
+        revert UnknownOp(op);
+    }
+
+    /// @dev An operand is usable iff the ACL allows the caller on it
+    /// (which also proves the handle exists — every real handle has at
+    /// least one grant) and its type matches. A symbolic operand need
+    /// NOT be materialized yet: requests are fulfilled in order, so an
+    /// earlier result is available by the time this op executes.
+    function _requireOperand(bytes32 handle, uint8 wantType) internal view {
+        if (!isAllowed[handle][msg.sender]) revert NotAllowed(handle, msg.sender);
+        uint8 tagged = symbolicType[handle];
+        uint8 actual = tagged == 0 ? TYPE_EUINT64 : tagged - 1;
+        if (actual != wantType) revert WrongOperandType(handle);
+    }
+
+    /// @dev Resolves a `batchRef` marker against the results derived so
+    /// far; non-markers pass through. Only strictly earlier ops are
+    /// resolvable — execution is in op order.
+    function _resolveRef(bytes32 handle, bytes32[] memory results, uint256 current)
+        internal
+        pure
+        returns (bytes32)
+    {
+        if (bytes24(handle) != REF_PREFIX) return handle;
+        uint256 index = uint256(handle) & type(uint64).max;
+        if (index >= current) revert RefOutOfRange(handle, current);
+        return results[index];
+    }
+
+    /// @dev The symbolic result handle: keccak over a domain tag, the
+    /// op, its inputs, the request id, and the op's index within the
+    /// request, with the fhEVM-style trailing bytes written in — byte
+    /// 21 = 0xff (computed marker), byte 30 = type tag, byte 31 =
+    /// version. Anyone can recompute it; the coprocessor re-derives
+    /// and refuses a mismatch.
+    function _symbolicHandle(
+        uint8 op,
+        bytes32 lhs,
+        bytes32 rhs,
+        bytes32 cond,
+        uint64 id,
+        uint32 index,
+        uint8 typeTag
+    ) internal pure returns (bytes32) {
+        uint256 h =
+            uint256(keccak256(abi.encodePacked("fhe.rs/sym", op, lhs, rhs, cond, id, index)));
+        h = (h & ~(uint256(0xff) << 80)) | (uint256(0xff) << 80); // byte 21
+        h = (h & ~(uint256(0xff) << 8)) | (uint256(typeTag) << 8); // byte 30
+        h = (h & ~uint256(0xff)) | uint256(HANDLE_VERSION); // byte 31
+        return bytes32(h);
+    }
+
     function _request(uint8 op, bytes memory payload) internal returns (uint64 id) {
         id = nextRequestId++;
-        requestOp[id] = op;
+        requestOpTag[id] = op;
         requestHash[id] = keccak256(payload);
     }
 
@@ -447,14 +747,29 @@ contract ConfidentialTokenGateway {
         if (id != lastFulfilledId + 1 || id >= nextRequestId) {
             revert OutOfOrderFulfillment(id, lastFulfilledId + 1);
         }
-        if (requestOp[id] != op || requestHash[id] != payloadHash) revert RequestMismatch(id);
+        if (requestOpTag[id] != op || requestHash[id] != payloadHash) revert RequestMismatch(id);
         lastFulfilledId = id;
-        delete requestOp[id];
+        delete requestOpTag[id];
         delete requestHash[id];
     }
 
     function _rotate(address account, bytes32 newHandle, bytes32 commitment) internal {
         confidentialBalanceOf[account] = newHandle;
         handleCommitment[newHandle] = commitment;
+    }
+
+    /// @dev Idempotent ACL grant; emits `Allowed` once per new grant.
+    function _allow(bytes32 handle, address account) internal {
+        if (!isAllowed[handle][account]) {
+            isAllowed[handle][account] = true;
+            emit Allowed(handle, account);
+        }
+    }
+
+    /// @dev Grant to an observer snapshot, skipping the no-observer zero.
+    function _allowObserver(bytes32 handle, address observer) internal {
+        if (observer != address(0)) {
+            _allow(handle, observer);
+        }
     }
 }

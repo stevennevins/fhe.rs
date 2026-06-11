@@ -3,12 +3,12 @@
 //! on-chain handle, and the `Address ↔ Account` binding that turns
 //! `msg.sender` into the kit's authenticated caller.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use alloy::primitives::{Address, B256, keccak256};
 use fhe::bfv::BfvParameters;
-use fhe::gateway::Committee;
+use fhe::gateway::{Committee, CompareTranscript};
 use fhe::token::ConfidentialToken;
 use fhe::token::extensions::observer::Observers;
 use fhe::token::extensions::rwa::Rwa;
@@ -18,8 +18,77 @@ use fhe_traits::{DeserializeParametrized, Serialize};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-use crate::requests::{Fulfillment, HandleCommitment, Request};
+use crate::requests::{Fulfillment, HandleCommitment, Request, ops, types};
 use crate::{Error, Result};
+
+/// The version byte (31) of a symbolic handle.
+const HANDLE_VERSION: u8 = 0;
+
+/// The symbolic result handle, exactly as the contract derives it:
+/// keccak over a domain tag, the op, its inputs, the request id, and
+/// the op's index within the request, with the fhEVM-style trailing
+/// bytes written in — byte 21 = 0xff (computed marker), byte 30 = the
+/// type tag, byte 31 = the version. The coprocessor re-derives this
+/// and refuses to materialize a mismatch.
+#[must_use]
+pub fn symbolic_handle(
+    op: u8,
+    lhs: B256,
+    rhs: B256,
+    cond: B256,
+    id: u64,
+    index: u32,
+    type_tag: u8,
+) -> B256 {
+    let mut preimage = Vec::with_capacity(10 + 1 + 96 + 8 + 4);
+    preimage.extend_from_slice(b"fhe.rs/sym");
+    preimage.push(op);
+    preimage.extend_from_slice(lhs.as_slice());
+    preimage.extend_from_slice(rhs.as_slice());
+    preimage.extend_from_slice(cond.as_slice());
+    preimage.extend_from_slice(&id.to_be_bytes());
+    preimage.extend_from_slice(&index.to_be_bytes());
+    let mut handle = keccak256(&preimage);
+    handle.0[21] = 0xff;
+    handle.0[30] = type_tag;
+    handle.0[31] = HANDLE_VERSION;
+    handle
+}
+
+/// The result type of a symbolic op: comparisons yield ebool,
+/// everything else euint64.
+#[must_use]
+pub fn op_result_type(op: u8) -> u8 {
+    if op == ops::GE {
+        types::EBOOL
+    } else {
+        types::EUINT64
+    }
+}
+
+/// Resolves an intra-batch `batchRef` marker against the results
+/// derived so far, exactly as the contract does; non-markers pass
+/// through. Only strictly earlier ops resolve.
+fn resolve_ref(handle: B256, results: &[B256], current: usize) -> Result<B256> {
+    let prefix = keccak256(b"fhe.rs/ref");
+    if handle.0[..24] != prefix.0[..24] {
+        return Ok(handle);
+    }
+    let mut index_bytes = [0u8; 8];
+    index_bytes.copy_from_slice(&handle.0[24..]);
+    let index = usize::try_from(u64::from_be_bytes(index_bytes))
+        .map_err(|_| Error::State(format!("batch ref {handle} index overflows")))?;
+    if index >= current {
+        return Err(Error::State(format!(
+            "batch ref {handle} points at op {index}, not strictly earlier than {current}"
+        )));
+    }
+    results.get(index).copied().ok_or_else(|| {
+        Error::State(format!(
+            "batch ref {handle} points outside the batch ({index})"
+        ))
+    })
+}
 
 /// A ciphertext the coprocessor stores on behalf of the chain: the
 /// serialized bytes and the keccak256 commitment anchored on-chain.
@@ -45,6 +114,8 @@ pub struct Coprocessor {
     observers: Observers,
     ledger: PublicLedger,
     params: Arc<BfvParameters>,
+    /// The agent (and freezer) address, for the freezer's ACL grants.
+    agent: Address,
     /// Address → kit account, assigned sequentially on first sight in
     /// event order (deterministic under replay).
     accounts: HashMap<Address, u64>,
@@ -52,8 +123,17 @@ pub struct Coprocessor {
     /// Registered input ciphertexts (ownership is enforced on-chain).
     inputs: HashMap<B256, FheUint64>,
     store: HashMap<B256, StoredCiphertext>,
-    /// On-chain handle → kit-internal handle for coprocessor outputs.
-    kit_handles: HashMap<B256, fhe::token::Handle>,
+    /// The mirror of the contract's on-chain ACL (`isAllowed`), built
+    /// from the same request stream that writes it on-chain: handle →
+    /// the addresses allowed to read (decrypt) it. This — not the kit's
+    /// private ACL — is what [`Coprocessor::decrypt_for`] enforces.
+    acl: HashMap<B256, HashSet<Address>>,
+    /// The mirror of the contract's `observerOf`, by address, for the
+    /// observer grants written at handle rotation.
+    observer_of: HashMap<Address, Address>,
+    /// Comparison transcripts of symbolic `ge` ops, for the same
+    /// single-party-view leakage sweeps as the token's audit logs.
+    op_compares: Vec<CompareTranscript>,
     rng: ChaCha20Rng,
     handle_nonce: u64,
 }
@@ -74,11 +154,14 @@ impl Coprocessor {
             observers: Observers::new(),
             ledger: PublicLedger::new(),
             params,
+            agent,
             accounts,
             next_account: AGENT_ACCOUNT + 1,
             inputs: HashMap::new(),
             store: HashMap::new(),
-            kit_handles: HashMap::new(),
+            acl: HashMap::new(),
+            observer_of: HashMap::new(),
+            op_compares: Vec::new(),
             rng,
             handle_nonce: 0,
         })
@@ -109,6 +192,14 @@ impl Coprocessor {
         &self.ledger
     }
 
+    /// The comparison transcripts of every symbolic `ge` executed, in
+    /// request order — the audit log the Goal D leakage sweeps run
+    /// over for the symbolic alphabet.
+    #[must_use]
+    pub fn op_compares(&self) -> &[CompareTranscript] {
+        &self.op_compares
+    }
+
     /// The kit account bound to `address`, assigned on first sight.
     pub fn account_of(&mut self, address: Address) -> u64 {
         if let Some(id) = self.accounts.get(&address) {
@@ -131,7 +222,7 @@ impl Coprocessor {
     /// id. The caller (the client) anchors the pair on-chain via
     /// `registerInput`, which is where ownership is bound and enforced;
     /// the user then passes only the handle in their transaction.
-    pub fn register_input(&mut self, bytes: &[u8]) -> Result<(B256, B256)> {
+    pub fn register_input(&mut self, bytes: &[u8], owner: Address) -> Result<(B256, B256)> {
         let ciphertext = FheUint64::from_bytes(bytes, &self.params)?;
         let commitment = keccak256(bytes);
         let handle = self.fresh_handle(commitment);
@@ -143,6 +234,9 @@ impl Coprocessor {
             },
         );
         self.inputs.insert(handle, ciphertext);
+        // The same grant `registerInput` writes on-chain: the owner may
+        // read the input it created.
+        self.allow_mirror(handle, owner);
         Ok((handle, commitment))
     }
 
@@ -231,6 +325,7 @@ impl Coprocessor {
                     self.token.allow(balance, acct, observer)?;
                 }
                 let new_balance = self.export_balance(account)?;
+                self.allow_with_observer(new_balance.handle, account);
                 Ok(Fulfillment::Wrap {
                     id,
                     account,
@@ -261,6 +356,12 @@ impl Coprocessor {
                 let new_from = self.export_balance(from)?;
                 let new_to = self.export_balance(to)?;
                 let transferred = self.export(transferred_kit, from_acct)?;
+                // The grants `fulfillTransfer` writes on-chain for an
+                // observed transfer.
+                self.allow_with_observer(new_from.handle, from);
+                self.allow_with_observer(new_to.handle, to);
+                self.allow_with_observer(transferred.handle, from);
+                self.allow_with_observer(transferred.handle, to);
                 Ok(Fulfillment::Transfer {
                     id,
                     from,
@@ -279,9 +380,11 @@ impl Coprocessor {
                 let acct = self.account_of(account);
                 if observer == Address::ZERO {
                     self.observers.remove_observer(acct);
+                    self.observer_of.remove(&account);
                 } else {
-                    let observer = self.account_of(observer);
-                    self.observers.set_observer(acct, observer);
+                    let observer_acct = self.account_of(observer);
+                    self.observers.set_observer(acct, observer_acct);
+                    self.observer_of.insert(account, observer);
                 }
                 Ok(Fulfillment::Ack { id })
             }
@@ -303,6 +406,9 @@ impl Coprocessor {
                     amount,
                 )?;
                 let new_frozen = self.export(frozen_kit, acct)?;
+                // Frozen amounts read by the account and the freezer.
+                self.allow_mirror(new_frozen.handle, account);
+                self.allow_mirror(new_frozen.handle, self.agent);
                 Ok(Fulfillment::FrozenSet {
                     id,
                     account,
@@ -355,6 +461,12 @@ impl Coprocessor {
                 let new_from = self.export_balance(from)?;
                 let new_to = self.export_balance(to)?;
                 let transferred = self.export(transferred_kit, from_acct)?;
+                // Unobserved on-chain too: each party reads its own
+                // rotated balance, both read the transferred amount.
+                self.allow_mirror(new_from.handle, from);
+                self.allow_mirror(new_to.handle, to);
+                self.allow_mirror(transferred.handle, from);
+                self.allow_mirror(transferred.handle, to);
                 Ok(Fulfillment::Transfer {
                     id,
                     from,
@@ -391,6 +503,10 @@ impl Coprocessor {
                         ))
                     })?;
                 let new_recipient_frozen = self.export(frozen_kit, recipient_acct)?;
+                self.allow_mirror(new_lost.handle, lost);
+                self.allow_mirror(new_recipient.handle, recipient);
+                self.allow_mirror(new_recipient_frozen.handle, recipient);
+                self.allow_mirror(new_recipient_frozen.handle, self.agent);
                 Ok(Fulfillment::Recover {
                     id,
                     lost,
@@ -415,6 +531,7 @@ impl Coprocessor {
                 {
                     Ok(amount) => {
                         let new_balance = self.export_balance(account)?;
+                        self.allow_mirror(new_balance.handle, account);
                         Ok(Fulfillment::Unwrap {
                             id,
                             account,
@@ -445,30 +562,195 @@ impl Coprocessor {
                     }
                 }
             }
+            Request::SymbolicOp {
+                id,
+                caller,
+                op,
+                lhs,
+                rhs,
+                cond,
+                result,
+            } => {
+                // Re-derive the contract's symbolic handle: the chain
+                // and the executor must agree on what is being bound.
+                let derived = symbolic_handle(op, lhs, rhs, cond, id, 0, op_result_type(op));
+                if derived != result {
+                    return Err(Error::State(format!(
+                        "request {id}: symbolic handle mismatch (chain {result}, derived {derived})"
+                    )));
+                }
+                let output = self.execute_symbolic(op, lhs, rhs, cond)?;
+                let bytes = output.to_bytes();
+                let commitment = keccak256(&bytes);
+                self.store
+                    .insert(result, StoredCiphertext { bytes, commitment });
+                self.allow_mirror(result, caller);
+                Ok(Fulfillment::Op {
+                    id,
+                    caller,
+                    op,
+                    lhs,
+                    rhs,
+                    cond,
+                    result,
+                    commitment,
+                })
+            }
+            Request::Batch {
+                id,
+                caller,
+                ref ops,
+                ref results,
+            } => {
+                if results.len() != ops.len() {
+                    return Err(Error::State(format!(
+                        "request {id}: batch shape mismatch ({} ops, {} results)",
+                        ops.len(),
+                        results.len()
+                    )));
+                }
+                let mut commitments = Vec::with_capacity(ops.len());
+                for (i, (spec, &result)) in ops.iter().zip(results.iter()).enumerate() {
+                    let lhs = resolve_ref(spec.lhs, results, i)?;
+                    let rhs = resolve_ref(spec.rhs, results, i)?;
+                    let cond = resolve_ref(spec.cond, results, i)?;
+                    let index = u32::try_from(i)
+                        .map_err(|_| Error::State(format!("batch op index {i} overflows")))?;
+                    let derived = symbolic_handle(
+                        spec.op,
+                        lhs,
+                        rhs,
+                        cond,
+                        id,
+                        index,
+                        op_result_type(spec.op),
+                    );
+                    if derived != result {
+                        return Err(Error::State(format!(
+                            "request {id}, op {i}: symbolic handle mismatch \
+                             (chain {result}, derived {derived})"
+                        )));
+                    }
+                    let output = self.execute_symbolic(spec.op, lhs, rhs, cond)?;
+                    let bytes = output.to_bytes();
+                    let commitment = keccak256(&bytes);
+                    self.store
+                        .insert(result, StoredCiphertext { bytes, commitment });
+                    self.allow_mirror(result, caller);
+                    commitments.push(commitment);
+                }
+                Ok(Fulfillment::Batch {
+                    id,
+                    caller,
+                    ops: ops.clone(),
+                    results: results.clone(),
+                    commitments,
+                })
+            }
+            // Already authorized and written on-chain (chain of custody
+            // checked by the contract); mirrored here in request order.
+            Request::Allow {
+                id,
+                handle,
+                account,
+            } => {
+                self.allow_mirror(handle, account);
+                Ok(Fulfillment::Ack { id })
+            }
         }
     }
 
     /// The on-chain read path: threshold-decrypts the ciphertext behind
-    /// an on-chain `handle` on behalf of `caller`, enforcing the token
-    /// ACL that on-chain transactions (ownership, observer grants)
-    /// built. Integrity-checks the store first.
+    /// an on-chain `handle` on behalf of `caller`, enforcing the
+    /// CONTRACT's ACL — the mirror of `isAllowed` that on-chain
+    /// transactions (ownership, observer grants, `allow`) built.
+    /// Integrity-checks the store first. The decryption itself is the
+    /// committee's designated decryption, exactly as before — only the
+    /// authorization source changed from the kit's private ACL to the
+    /// on-chain state.
     pub fn decrypt_for(&mut self, handle: B256, caller: Address) -> Result<u64> {
         if !self.verify_stored(handle) {
             return Err(Error::State(format!(
                 "stored bytes behind {handle} no longer match their commitment"
             )));
         }
-        let account = *self
-            .accounts
-            .get(&caller)
-            .ok_or_else(|| Error::State(format!("address {caller} is not bound to any account")))?;
-        let kit_handle = self
-            .kit_handles
+        if !self
+            .acl
             .get(&handle)
-            .ok_or_else(|| Error::State(format!("no coprocessor output behind handle {handle}")))?;
+            .is_some_and(|allowed| allowed.contains(&caller))
+        {
+            return Err(Error::State(format!(
+                "the on-chain ACL does not allow {caller} on handle {handle}"
+            )));
+        }
+        let stored = self
+            .store
+            .get(&handle)
+            .ok_or_else(|| Error::State(format!("no ciphertext stored behind handle {handle}")))?;
+        let ciphertext = FheUint64::from_bytes(&stored.bytes, &self.params)?;
         Ok(self
             .token
-            .decrypt_for(*kit_handle, account, &mut self.rng)?)
+            .committee()
+            .threshold_decrypt(&ciphertext, &mut self.rng)?)
+    }
+
+    /// Executes one symbolic op over the stored ciphertexts. Encrypted
+    /// semantics never error: `ge` always yields an encrypted bit and
+    /// `select` always blends — only a structurally missing operand
+    /// (a chain/mirror inconsistency) propagates.
+    fn execute_symbolic(&mut self, op: u8, lhs: B256, rhs: B256, cond: B256) -> Result<FheUint64> {
+        let a = self.ciphertext_of(lhs)?;
+        let b = self.ciphertext_of(rhs)?;
+        match op {
+            ops::ADD => Ok(&a + &b),
+            ops::SUB => Ok(&a - &b),
+            ops::GE => {
+                let (bit, transcript) =
+                    self.token
+                        .committee()
+                        .compare_ge_with_transcript(&a, &b, &mut self.rng)?;
+                self.op_compares.push(transcript);
+                Ok(bit)
+            }
+            ops::SELECT => {
+                let condition = self.ciphertext_of(cond)?;
+                Ok(fhe::typed::safe_math::select(&condition, &a, &b))
+            }
+            _ => Err(Error::State(format!(
+                "unknown symbolic op {op} (the contract validates the alphabet)"
+            ))),
+        }
+    }
+
+    /// The ciphertext behind any stored handle (input, rotation output,
+    /// or materialized symbolic result), integrity-checked.
+    fn ciphertext_of(&self, handle: B256) -> Result<FheUint64> {
+        if !self.verify_stored(handle) {
+            return Err(Error::State(format!(
+                "stored bytes behind {handle} no longer match their commitment"
+            )));
+        }
+        let stored = self
+            .store
+            .get(&handle)
+            .ok_or_else(|| Error::State(format!("no ciphertext stored behind handle {handle}")))?;
+        Ok(FheUint64::from_bytes(&stored.bytes, &self.params)?)
+    }
+
+    /// Mirrors one on-chain `Allowed` grant: `who` may read `handle`.
+    fn allow_mirror(&mut self, handle: B256, who: Address) {
+        self.acl.entry(handle).or_default().insert(who);
+    }
+
+    /// Mirrors the contract's rotation grant: the account, plus its
+    /// observer as of the current point in the request stream (the
+    /// contract snapshots the observer at request time; processing in
+    /// request order sees the same state).
+    fn allow_with_observer(&mut self, handle: B256, account: Address) {
+        self.allow_mirror(handle, account);
+        if let Some(observer) = self.observer_of.get(&account).copied() {
+            self.allow_mirror(handle, observer);
+        }
     }
 
     /// Replays `Observers::transfer`'s grants over the RWA transfer's
@@ -512,7 +794,6 @@ impl Coprocessor {
         let handle = self.fresh_handle(commitment);
         self.store
             .insert(handle, StoredCiphertext { bytes, commitment });
-        self.kit_handles.insert(handle, kit_handle);
         Ok(HandleCommitment { handle, commitment })
     }
 

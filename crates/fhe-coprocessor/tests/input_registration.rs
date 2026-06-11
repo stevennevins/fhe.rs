@@ -85,7 +85,7 @@ fn tampered_stored_bytes_are_detected() {
 
     let amount = coprocessor.committee().encrypt(7, &mut rng).unwrap();
     let bytes = amount.to_bytes();
-    let (handle, commitment) = coprocessor.register_input(&bytes).unwrap();
+    let (handle, commitment) = coprocessor.register_input(&bytes, agent_address).unwrap();
     assert_eq!(commitment, keccak256(&bytes));
     assert!(coprocessor.verify_stored(handle));
     assert!(coprocessor.input_ciphertext(handle).is_ok());
