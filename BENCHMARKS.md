@@ -294,3 +294,33 @@ The batch's single fulfillment beats the two sequential round trips
 (0.43 s CPU, 0.28 s CUDA) — the latency side of the gas amortization
 measured in `tests/onchain_batch.rs` (at 8 ops, batching roughly
 halves both request and fulfillment gas: 735,735 vs 1,498,916 total).
+
+## On-chain ACL gas impact (Goal H1, named cost)
+
+Moving the ACL on-chain prices every grant at roughly **24k gas** (one
+cold storage slot plus the `Allowed` event). Measured by replaying the
+identical canonical observed flow (`contracts/test/GasImpact.t.sol`)
+on the Goal G base (42909d6) and on Goal H:
+
+```bash
+cd contracts && forge test --match-contract GasImpactTest --gas-report
+```
+
+| Function | Goal G | Goal H | Δ | grants written |
+|---|---|---|---|---|
+| `registerInput` | 68,784 | 92,961 | +24,177 | 1 (owner) |
+| `wrap` (entry) | 74,066 | 98,485 | +24,419 | 0 (observer snapshot) |
+| `confidentialTransfer` (entry) | 87,636 | 116,472 | +28,836 | 0 (two snapshots) |
+| `fulfillWrap` | 75,726 | 124,571 | +48,845 | 2 (account, observer) |
+| `fulfillTransfer` (observed) | 128,456 | 276,390 | +147,934 | 6 (both balances; both parties + observer on the amount) |
+| `faucet` / `setObserver` / `setVerified` / `fulfillAck` | — | — | ≤ ±50 | 0 |
+
+The worst case — an observed transfer's fulfillment — roughly doubles;
+unobserved paths (force transfer, unwrap, acks) pay one grant or none.
+The Goal G gas-shape property is unchanged where asserted: a silent
+zero still costs the same as a success — both simply pay the grants.
+
+FHE latency is unaffected within run-to-run noise (the ACL is pure
+chain-side bookkeeping): re-measured against the Goal G table above,
+freezable transfer 1.50→1.52 s CPU / 0.51→0.52 s CUDA, silent zero
+1.49→1.51 / 0.51→0.52, force transfer 1.24→1.26 / 0.44→0.45.
