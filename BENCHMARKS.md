@@ -274,3 +274,23 @@ per-extension circuit cost (see the table above) plus two anvil
 transactions and the coprocessor's ciphertext serialization. The silent
 zero row is the point of the never-revert design — it costs the same as
 a successful transfer, on-chain and off.
+
+## Symbolic ops and batched fulfillment (Goal H)
+
+Request-tx → fulfillment-tx latency of the symbolic-op surface, same
+harness and parameters as the table above (the e2e's step 10; the
+`--nocapture` commands above print these rows too). `ge` is the
+committee's blinded-difference comparison; `select` is one homomorphic
+multiplication; the batch row runs the same `ge` + `select`
+composition as ONE request with ONE `fulfillBatch` transaction.
+
+| Op | CPU | CUDA |
+|---|---|---|
+| symbolic `ge` | 0.19 s | 0.16 s |
+| symbolic `select` | 0.24 s | 0.12 s |
+| batch (`ge` + `select`, one fulfillment) | 0.34 s | 0.16 s |
+
+The batch's single fulfillment beats the two sequential round trips
+(0.43 s CPU, 0.28 s CUDA) — the latency side of the gas amortization
+measured in `tests/onchain_batch.rs` (at 8 ops, batching roughly
+halves both request and fulfillment gas: 735,735 vs 1,498,916 total).

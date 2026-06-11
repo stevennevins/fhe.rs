@@ -534,9 +534,13 @@ async fn onchain_e2e() {
     {
         let bid_a = as_alice.encrypt_input(7_000).await.unwrap();
         let bid_b = as_alice.encrypt_input(9_500).await.unwrap();
+        let started = Instant::now();
         let a_wins = as_alice.ge(bid_a, bid_b).await.unwrap();
+        latencies.push(("symbolic ge", started.elapsed()));
         raw_sym.push((7_000, 9_500));
+        let started = Instant::now();
         let winning = as_alice.select(a_wins, bid_a, bid_b).await.unwrap();
+        latencies.push(("symbolic select", started.elapsed()));
         assert_eq!(as_alice.decrypt(a_wins).await.unwrap(), 0);
         assert_eq!(as_alice.decrypt(winning).await.unwrap(), 9_500);
         // The deferred commitment landed and binds the stored bytes.
@@ -550,6 +554,28 @@ async fn onchain_e2e() {
         }
         // The never-granted intruder is denied on symbolic results too.
         assert!(as_intruder.decrypt(winning).await.is_err());
+
+        // The same composition as ONE atomic batch: one request id,
+        // one fulfillment for both ops (the batched-fulfillment row of
+        // the BENCHMARKS.md table).
+        let started = Instant::now();
+        let results = as_alice
+            .batch(&[
+                fhe_coprocessor::OpSpec::ge(bid_a, bid_b),
+                fhe_coprocessor::OpSpec::select(
+                    fhe_coprocessor::OpSpec::result_of(0),
+                    bid_a,
+                    bid_b,
+                ),
+            ])
+            .await
+            .unwrap();
+        latencies.push(("batch (ge + select, one fulfillment)", started.elapsed()));
+        raw_sym.push((7_000, 9_500));
+        assert_eq!(
+            as_alice.decrypt(*results.last().unwrap()).await.unwrap(),
+            9_500
+        );
     }
 
     // Final leakage sweep (d): the Goal D/E single-party-view

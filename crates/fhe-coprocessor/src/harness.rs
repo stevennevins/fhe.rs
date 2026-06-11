@@ -95,6 +95,13 @@ fn contracts_root() -> PathBuf {
 /// Runs `forge build` on the repo's contracts (cached by forge, cheap
 /// when up to date) and returns the gateway's creation bytecode.
 pub fn gateway_bytecode() -> Result<Vec<u8>> {
+    contract_bytecode("ConfidentialTokenGateway")
+}
+
+/// Runs `forge build` and returns the creation bytecode of any
+/// contract in the repo's Foundry project (the gateway, the example
+/// contracts) — append ABI-encoded constructor args before deploying.
+pub fn contract_bytecode(contract: &str) -> Result<Vec<u8>> {
     let root = contracts_root();
     let output = Command::new("forge")
         .arg("build")
@@ -107,7 +114,7 @@ pub fn gateway_bytecode() -> Result<Vec<u8>> {
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    let artifact = root.join("out/ConfidentialTokenGateway.sol/ConfidentialTokenGateway.json");
+    let artifact = root.join(format!("out/{contract}.sol/{contract}.json"));
     let json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&artifact).map_err(chain_err)?).map_err(chain_err)?;
     let hex = json
