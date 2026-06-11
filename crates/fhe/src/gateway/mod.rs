@@ -240,6 +240,15 @@ impl Committee {
         &self.pk
     }
 
+    /// The BFV parameters this committee was generated under. The
+    /// committee is the one object a deployment must hold on to, so it
+    /// answers for its own parameters instead of making every embedder
+    /// carry them alongside it.
+    #[must_use]
+    pub fn params(&self) -> &Arc<BfvParameters> {
+        &self.par
+    }
+
     /// A server key wrapping the collective relinearization key, for
     /// installation via [`crate::typed::set_server_key`].
     #[must_use]

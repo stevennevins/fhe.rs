@@ -1,16 +1,15 @@
-//! G5: coprocessor crash-and-restart. The contract's `lastFulfilledId`
-//! is the durable cursor; a service that dies mid-lifecycle is rebuilt
-//! over the surviving durable state, replays the event log, skips
-//! everything already fulfilled (idempotency per request id), and
-//! resumes in order. Toy FHE parameters.
+//! Coprocessor crash-and-restart. The contract's `lastFulfilledId` is
+//! the durable cursor; an operator whose loop dies mid-lifecycle hands
+//! its durable state over, and the resumed operator replays the event
+//! log, skips everything already fulfilled (idempotency per request
+//! id), and resumes in order. Toy FHE parameters.
 
 mod common;
 
 use fhe::gateway::Committee;
 use fhe::typed::FheUint64;
 use fhe_coprocessor::abi::IConfidentialTokenGateway;
-use fhe_coprocessor::{Coprocessor, Service, harness};
-use fhe_traits::Serialize;
+use fhe_coprocessor::{Operator, harness};
 use rand::rng;
 
 #[tokio::test]
@@ -26,85 +25,77 @@ async fn crash_and_restart_resumes_from_the_last_fulfilled_request() {
     let devnet = common::spawn_devnet(2).await;
     let alice = devnet.users.first().unwrap();
     let bob = devnet.users.get(1).unwrap();
-    let coprocessor = Coprocessor::new(committee, params, devnet.agent.address).unwrap();
-    let mut service = Service::new(
-        coprocessor,
+    let operator = Operator::new(
+        committee,
+        devnet.agent.address,
         devnet.coprocessor.provider.clone(),
         devnet.gateway,
-    );
+    )
+    .unwrap();
+    let as_alice = operator.client(alice.provider.clone(), alice.address).await;
+    let as_bob = operator.client(bob.provider.clone(), bob.address).await;
 
-    let as_alice = IConfidentialTokenGateway::new(devnet.gateway, alice.provider.clone());
-    let as_agent = IConfidentialTokenGateway::new(devnet.gateway, devnet.agent.provider.clone());
+    // Raw bindings: the pre-crash requests are sent WITHOUT waiting for
+    // fulfillment (the loop is about to die mid-batch), which a client
+    // call would block on.
+    let raw_alice = IConfidentialTokenGateway::new(devnet.gateway, alice.provider.clone());
+    let raw_agent = IConfidentialTokenGateway::new(devnet.gateway, devnet.agent.provider.clone());
 
-    macro_rules! exec {
-        ($call:expr) => {
-            $call.send().await.unwrap().get_receipt().await.unwrap()
-        };
+    // Receipts by direct lookup: the ws get_receipt watcher can miss
+    // an automined block and hang (see harness::wait_receipt).
+    macro_rules! request {
+        ($call:expr) => {{
+            let pending = $call.send().await.unwrap();
+            let provider = alice.provider.clone();
+            harness::wait_receipt(&provider, *pending.tx_hash())
+                .await
+                .unwrap()
+        }};
     }
-    exec!(as_agent.setVerified(bob.address, true));
-    exec!(as_alice.faucet(1000));
-    exec!(as_alice.wrap(800));
-    service.catch_up().await.unwrap();
+    request!(raw_agent.setVerified(bob.address, true));
+    request!(raw_alice.faucet(1000));
+    request!(raw_alice.wrap(800));
+    operator.run_until_idle().await.unwrap();
 
     // Two transfers and an observer change are requested...
-    let ct = service
-        .coprocessor()
-        .committee()
-        .encrypt(100, &mut rng)
-        .unwrap();
-    let (transfer_a, _) = service
-        .register_and_anchor(alice.address, &ct.to_bytes())
-        .await
-        .unwrap();
-    let ct = service
-        .coprocessor()
-        .committee()
-        .encrypt(50, &mut rng)
-        .unwrap();
-    let (transfer_b, _) = service
-        .register_and_anchor(alice.address, &ct.to_bytes())
-        .await
-        .unwrap();
-    exec!(as_alice.transfer(bob.address, transfer_a));
-    exec!(as_alice.setObserver(bob.address));
-    exec!(as_alice.transfer(bob.address, transfer_b));
+    let transfer_a = as_alice.encrypt_input(100).await.unwrap();
+    let transfer_b = as_alice.encrypt_input(50).await.unwrap();
+    request!(raw_alice.confidentialTransfer(bob.address, transfer_a));
+    request!(raw_alice.setObserver(bob.address));
+    request!(raw_alice.confidentialTransfer(bob.address, transfer_b));
 
-    // ...but the service dies after fulfilling only the FIRST of them.
-    let crash_after = as_agent.lastFulfilledId().call().await.unwrap() + 1;
-    service.run_until(crash_after).await.unwrap();
+    // ...but the loop dies after fulfilling only the FIRST of them.
+    let crash_after = raw_agent.lastFulfilledId().call().await.unwrap() + 1;
+    operator.run_until(crash_after).await.unwrap();
     assert_eq!(
-        as_agent.lastFulfilledId().call().await.unwrap(),
+        raw_agent.lastFulfilledId().call().await.unwrap(),
         crash_after
     );
-    let durable_state = service.into_coprocessor();
+    let durable_state = operator.into_state();
 
-    // A restarted service takes over the durable state, replays the
+    // A restarted operator takes over the durable state, replays the
     // log, skips what the cursor says is done, and resumes in order.
-    let mut restarted = Service::new(
+    let restarted = Operator::resume(
         durable_state,
         devnet.coprocessor.provider.clone(),
         devnet.gateway,
     );
-    restarted.catch_up().await.unwrap();
+    restarted.run_until_idle().await.unwrap();
 
     // Every request fulfilled exactly once: the cursor reached the last
     // request and the balances reflect each transfer applied once.
-    let next_request = as_agent.nextRequestId().call().await.unwrap();
+    let next_request = raw_agent.nextRequestId().call().await.unwrap();
     assert_eq!(
-        as_agent.lastFulfilledId().call().await.unwrap(),
+        raw_agent.lastFulfilledId().call().await.unwrap(),
         next_request - 1
     );
-    let alice_handle = as_agent.balanceHandle(alice.address).call().await.unwrap();
-    let bob_handle = as_agent.balanceHandle(bob.address).call().await.unwrap();
-    let state = restarted.coprocessor_mut();
-    assert_eq!(state.decrypt_for(alice_handle, alice.address).unwrap(), 650);
-    assert_eq!(state.decrypt_for(bob_handle, bob.address).unwrap(), 150);
+    assert_eq!(as_alice.balance(alice.address).await.unwrap(), 650);
+    assert_eq!(as_bob.balance(bob.address).await.unwrap(), 150);
     // The observer change requested before the crash was applied by the
-    // restarted service (bob observes alice's post-restart handles).
-    assert_eq!(state.decrypt_for(alice_handle, bob.address).unwrap(), 650);
+    // restarted operator (bob observes alice's post-restart handles).
+    assert_eq!(as_bob.balance(alice.address).await.unwrap(), 650);
 
     // Idempotency holds for a second catch-up too: nothing re-applies.
-    restarted.catch_up().await.unwrap();
-    let state = restarted.coprocessor_mut();
-    assert_eq!(state.decrypt_for(alice_handle, alice.address).unwrap(), 650);
+    restarted.run_until_idle().await.unwrap();
+    assert_eq!(as_alice.balance(alice.address).await.unwrap(), 650);
 }

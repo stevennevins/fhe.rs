@@ -8,6 +8,9 @@ use std::sync::OnceLock;
 
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::Address;
+use alloy::providers::fillers::{
+    BlobGasFiller, ChainIdFiller, GasFiller, NonceFiller, SimpleNonceManager,
+};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
@@ -16,13 +19,49 @@ use crate::{Error, Result, chain_err};
 
 /// Connects a wallet-backed websocket provider to the devnet, type-erased
 /// so tests and the coprocessor loop need no provider generics.
+///
+/// Nonces are fetched fresh per transaction (`SimpleNonceManager`)
+/// instead of the default cached manager: the fillers prepare jointly,
+/// so a send that fails gas estimation (an expected revert — public
+/// policy checks) would still burn a cached nonce and strand every
+/// later transaction from that wallet behind the gap.
 pub async fn connect(ws_url: &str, signer: PrivateKeySigner) -> Result<DynProvider> {
-    let provider = ProviderBuilder::new()
+    let provider = ProviderBuilder::default()
+        .filler(GasFiller)
+        .filler(BlobGasFiller::default())
+        .filler(NonceFiller::new(SimpleNonceManager::default()))
+        .filler(ChainIdFiller::default())
         .wallet(EthereumWallet::from(signer))
         .connect_ws(WsConnect::new(ws_url))
         .await
         .map_err(chain_err)?;
     Ok(provider.erased())
+}
+
+/// Fetches the receipt of `hash` by direct lookup, retrying until the
+/// transaction is mined (bounded). The ws `get_receipt` watcher can
+/// miss an instantly-mined transaction when the heartbeat's block
+/// subscription lags (its buffer drops silently), which strands the
+/// caller forever on an automining devnet — a direct lookup cannot.
+pub async fn wait_receipt(
+    provider: &DynProvider,
+    hash: alloy::primitives::B256,
+) -> Result<alloy::rpc::types::TransactionReceipt> {
+    // 30 s: an automined receipt is available within one round trip;
+    // this bound only decides how loudly a dropped transaction fails.
+    for _ in 0..600 {
+        if let Some(receipt) = provider
+            .get_transaction_receipt(hash)
+            .await
+            .map_err(chain_err)?
+        {
+            return Ok(receipt);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err(Error::Chain(format!(
+        "transaction {hash} was not mined within 30s"
+    )))
 }
 
 /// Whether `anvil` and `forge` are runnable on this machine. Tests that

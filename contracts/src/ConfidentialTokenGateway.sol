@@ -52,9 +52,9 @@ contract ConfidentialTokenGateway {
     /// @notice Public ERC20-side balances (the wrapper's public ledger).
     mapping(address => uint64) public publicBalance;
     /// @notice Current confidential balance handle per account (0 = none).
-    mapping(address => bytes32) public balanceHandle;
+    mapping(address => bytes32) public confidentialBalanceOf;
     /// @notice Current confidential frozen-amount handle per account.
-    mapping(address => bytes32) public frozenHandle;
+    mapping(address => bytes32) public confidentialFrozen;
     /// @notice keccak256 of the ciphertext bytes behind each handle the
     /// chain has seen (anchored inputs and fulfillment outputs alike).
     mapping(bytes32 => bytes32) public handleCommitment;
@@ -66,7 +66,7 @@ contract ConfidentialTokenGateway {
     /// @notice Blocklist (agent-set, public).
     mapping(address => bool) public blocked;
     /// @notice Identity registry: transfer recipients must be verified.
-    mapping(address => bool) public verified;
+    mapping(address => bool) public isVerified;
     /// @notice Current observer per account (0 = none). Set only by the
     /// account itself: `msg.sender` is the account, which closes the
     /// kit's unauthenticated `set_observer` caveat.
@@ -188,12 +188,12 @@ contract ConfidentialTokenGateway {
     /// encrypted input `amountHandle` to `to`. Public policy reverts
     /// here; the encrypted balance guard never reverts — an insufficient
     /// amount fulfills as a silent zero, indistinguishable on-chain.
-    function transfer(address to, bytes32 amountHandle) external {
+    function confidentialTransfer(address to, bytes32 amountHandle) external {
         if (paused) revert TransfersPaused();
         if (blocked[msg.sender]) revert AccountBlocked(msg.sender);
         if (blocked[to]) revert AccountBlocked(to);
-        if (!verified[to]) revert RecipientNotVerified(to);
-        if (balanceHandle[msg.sender] == 0) revert NoBalance(msg.sender);
+        if (!isVerified[to]) revert RecipientNotVerified(to);
+        if (confidentialBalanceOf[msg.sender] == 0) revert NoBalance(msg.sender);
         _requireOwnedInput(amountHandle);
         uint64 id = _request(OP_TRANSFER, abi.encode(msg.sender, to, amountHandle));
         emit TransferRequested(id, msg.sender, to, amountHandle);
@@ -208,10 +208,10 @@ contract ConfidentialTokenGateway {
     }
 
     /// @notice Marks `account` (un)verified in the identity registry.
-    function setVerified(address account, bool isVerified) external onlyAgent {
-        verified[account] = isVerified;
-        uint64 id = _request(OP_SET_VERIFIED, abi.encode(account, isVerified));
-        emit VerifiedSetRequested(id, account, isVerified);
+    function setVerified(address account, bool verified) external onlyAgent {
+        isVerified[account] = verified;
+        uint64 id = _request(OP_SET_VERIFIED, abi.encode(account, verified));
+        emit VerifiedSetRequested(id, account, verified);
     }
 
     /// @notice Sets `account`'s encrypted frozen amount to the registered
@@ -222,25 +222,54 @@ contract ConfidentialTokenGateway {
         emit FrozenSetRequested(id, account, amountHandle);
     }
 
-    /// @notice Blocks or unblocks `account` (public blocklist).
-    function setBlocked(address account, bool isBlocked) external onlyAgent {
+    /// @notice Blocks `account` (public blocklist, OZ ERC7984Rwa
+    /// naming).
+    function blockUser(address account) external onlyAgent {
+        _setBlocked(account, true);
+    }
+
+    /// @notice Unblocks `account`.
+    function unblockUser(address account) external onlyAgent {
+        _setBlocked(account, false);
+    }
+
+    function _setBlocked(address account, bool isBlocked) internal {
         blocked[account] = isBlocked;
         uint64 id = _request(OP_SET_BLOCKED, abi.encode(account, isBlocked));
         emit BlockedSetRequested(id, account, isBlocked);
     }
 
-    /// @notice Pauses or unpauses transfers.
-    function setPaused(bool isPaused) external onlyAgent {
+    /// @notice Pauses transfers (OZ Pausable naming).
+    function pause() external onlyAgent {
+        _setPaused(true);
+    }
+
+    /// @notice Unpauses transfers.
+    function unpause() external onlyAgent {
+        _setPaused(false);
+    }
+
+    function _setPaused(bool isPaused) internal {
         paused = isPaused;
         uint64 id = _request(OP_SET_PAUSED, abi.encode(isPaused));
         emit PausedSetRequested(id, isPaused);
     }
 
     /// @notice Agent-only transfer that bypasses pause, blocklist,
-    /// identity, and the frozen guard — but NOT the encrypted balance
+    /// identity, AND the frozen guard — but NOT the encrypted balance
     /// guard: overdraws still silently zero at fulfillment.
-    function forceTransfer(address from, address to, bytes32 amountHandle) external onlyAgent {
-        if (balanceHandle[from] == 0) revert NoBalance(from);
+    ///
+    /// DIVERGENCE FROM OZ: ERC7984Rwa's forceConfidentialTransferFrom
+    /// keeps the frozen guard ("frozen tokens must be unfrozen first");
+    /// here the agent's force transfer moves frozen funds too. This is
+    /// the kit's documented Rwa::force_transfer semantics, kept frozen
+    /// by Goal G — the name matches OZ, this behavior deliberately does
+    /// not.
+    function forceConfidentialTransferFrom(address from, address to, bytes32 amountHandle)
+        external
+        onlyAgent
+    {
+        if (confidentialBalanceOf[from] == 0) revert NoBalance(from);
         _requireOwnedInput(amountHandle);
         uint64 id = _request(OP_FORCE_TRANSFER, abi.encode(from, to, amountHandle));
         emit ForceTransferRequested(id, from, to, amountHandle);
@@ -250,7 +279,7 @@ contract ConfidentialTokenGateway {
     /// balance (frozen included) to `recipient`; the frozen portion
     /// re-freezes there, computed encrypted in the coprocessor.
     function recover(address lost, address recipient) external onlyAgent {
-        if (balanceHandle[lost] == 0) revert NoBalance(lost);
+        if (confidentialBalanceOf[lost] == 0) revert NoBalance(lost);
         uint64 id = _request(OP_RECOVER, abi.encode(lost, recipient));
         emit RecoverRequested(id, lost, recipient);
     }
@@ -260,8 +289,8 @@ contract ConfidentialTokenGateway {
     /// revealed at fulfillment (the wrapper's documented leakage); an
     /// insufficient confidential balance fulfills as a failure and
     /// credits nothing.
-    function requestUnwrap(bytes32 amountHandle) external {
-        if (balanceHandle[msg.sender] == 0) revert NoBalance(msg.sender);
+    function unwrap(bytes32 amountHandle) external {
+        if (confidentialBalanceOf[msg.sender] == 0) revert NoBalance(msg.sender);
         _requireOwnedInput(amountHandle);
         uint64 id = _request(OP_UNWRAP, abi.encode(msg.sender, amountHandle));
         emit UnwrapRequested(id, msg.sender, amountHandle);
@@ -347,7 +376,7 @@ contract ConfidentialTokenGateway {
         bytes32 newFrozenCommitment
     ) external onlyCoprocessor {
         _fulfill(id, OP_SET_FROZEN, keccak256(abi.encode(account, amountHandle)));
-        frozenHandle[account] = newFrozenHandle;
+        confidentialFrozen[account] = newFrozenHandle;
         handleCommitment[newFrozenHandle] = newFrozenCommitment;
         emit FrozenSetFulfilled(id, account, newFrozenHandle);
     }
@@ -369,9 +398,9 @@ contract ConfidentialTokenGateway {
         _fulfill(id, OP_RECOVER, keccak256(abi.encode(lost, recipient)));
         _rotate(lost, newLostHandle, newLostCommitment);
         _rotate(recipient, newRecipientHandle, newRecipientCommitment);
-        frozenHandle[recipient] = newRecipientFrozenHandle;
+        confidentialFrozen[recipient] = newRecipientFrozenHandle;
         handleCommitment[newRecipientFrozenHandle] = newRecipientFrozenCommitment;
-        delete frozenHandle[lost];
+        delete confidentialFrozen[lost];
         emit RecoverFulfilled(id, lost, recipient, newLostHandle, newRecipientHandle, newRecipientFrozenHandle);
     }
 
@@ -425,7 +454,7 @@ contract ConfidentialTokenGateway {
     }
 
     function _rotate(address account, bytes32 newHandle, bytes32 commitment) internal {
-        balanceHandle[account] = newHandle;
+        confidentialBalanceOf[account] = newHandle;
         handleCommitment[newHandle] = commitment;
     }
 }

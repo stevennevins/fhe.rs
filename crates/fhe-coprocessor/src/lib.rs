@@ -42,15 +42,17 @@
 //! and processing is idempotent per request id.
 
 pub mod abi;
-pub mod coprocessor;
+pub mod client;
+mod coprocessor;
 pub mod harness;
-pub mod requests;
-pub mod service;
+pub mod operator;
+mod requests;
 
+pub use client::Client;
 pub use coprocessor::Coprocessor;
-pub use service::Service;
+pub use operator::{Operator, OperatorHandle, OperatorState};
 
-/// Errors of the coprocessor service.
+/// Errors of the coprocessor crate.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// An error from the FHE kit underneath.

@@ -19,26 +19,28 @@ sol! {
         function nextRequestId() external view returns (uint64);
         function lastFulfilledId() external view returns (uint64);
         function publicBalance(address account) external view returns (uint64);
-        function balanceHandle(address account) external view returns (bytes32);
-        function frozenHandle(address account) external view returns (bytes32);
+        function confidentialBalanceOf(address account) external view returns (bytes32);
+        function confidentialFrozen(address account) external view returns (bytes32);
         function handleCommitment(bytes32 handle) external view returns (bytes32);
         function inputOwner(bytes32 handle) external view returns (address);
         function paused() external view returns (bool);
         function blocked(address account) external view returns (bool);
-        function verified(address account) external view returns (bool);
+        function isVerified(address account) external view returns (bool);
         function observerOf(address account) external view returns (address);
 
         function faucet(uint64 amount) external;
         function wrap(uint64 amount) external;
-        function transfer(address to, bytes32 amountHandle) external;
+        function confidentialTransfer(address to, bytes32 amountHandle) external;
         function setObserver(address observer) external;
         function setVerified(address account, bool isVerified) external;
         function setConfidentialFrozen(address account, bytes32 amountHandle) external;
-        function setBlocked(address account, bool isBlocked) external;
-        function setPaused(bool isPaused) external;
-        function forceTransfer(address from, address to, bytes32 amountHandle) external;
+        function blockUser(address account) external;
+        function unblockUser(address account) external;
+        function pause() external;
+        function unpause() external;
+        function forceConfidentialTransferFrom(address from, address to, bytes32 amountHandle) external;
         function recover(address lost, address recipient) external;
-        function requestUnwrap(bytes32 amountHandle) external;
+        function unwrap(bytes32 amountHandle) external;
 
         function registerInput(bytes32 handle, bytes32 commitment, address owner) external;
         function fulfillAck(uint64 id) external;

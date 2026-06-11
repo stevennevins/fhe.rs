@@ -27,6 +27,53 @@ parameter at all — a transaction can only set its **own** sender's
 observer, closing the Goal E caveat about unauthenticated
 `set_observer`.
 
+## Using the kit
+
+Two roles, two types, mirroring fhEVM's dApp-SDK / operator split:
+
+- **`fhe_coprocessor::Client`** — the user side. Encrypt-and-register
+  inputs, send entry-point transactions (each call resolves when its
+  request is fulfilled), read back what the ACL allows. A client
+  cannot reach the committee, the ciphertext store, or threshold
+  decryption — structurally, not by convention.
+- **`fhe_coprocessor::Operator`** — the operator side. One constructor
+  over the committee, `spawn()` for the live event loop,
+  `run_until_idle()`/`run_until()` for deterministic tests, and a
+  shutdown-and-handover seam (`into_state()`/`resume()`) for crash
+  recovery.
+
+The whole flow (`crates/fhe-coprocessor/examples/quickstart.rs` runs
+exactly this against a local anvil; it is also the acceptance test for
+the API's simplicity):
+
+```rust
+let operator = Operator::new(committee, agent, coprocessor_provider, gateway)?;
+let alice = operator.client(alice_provider, alice_address).await;
+let bob = operator.client(bob_provider, bob_address).await;
+let operator = operator.spawn();
+
+alice.faucet(1000).await?;          // public credit
+alice.wrap(1000).await?;            // public -> confidential
+let input = alice.encrypt_input(250).await?;   // encrypt, register, anchor
+alice.transfer(bob_address, input).await?;     // resolves on fulfillment
+let balance = alice.balance(alice_address).await?;  // ACL-checked decrypt
+```
+
+### fhEVM concept mapping
+
+| fhEVM concept | This kit |
+|---|---|
+| `createEncryptedInput(...).add64(v).encrypt()` | `client.encrypt_input(v)` — encrypts under the committee key, registers the ciphertext with the coprocessor, anchors `(handle, commitment, owner)` on-chain |
+| input handle (`input.handles[0]`) | the `B256` handle `encrypt_input` returns; spendable on-chain only by its owner |
+| input proof (`input.inputProof`) | **deliberately absent** — TODO-by-trust-model: the coprocessor validates inputs against the deployment parameters when it registers them, and v1 trusts it as executor; a ZK proof of plaintext knowledge is future work |
+| `confidentialTransfer(to, handle, proof)` | `client.transfer(to, input)` (contract entry point `confidentialTransfer(to, amountHandle)`) |
+| `confidentialBalanceOf(account)` (returns an `euint64` handle) | the contract's `confidentialBalanceOf(account)` (returns the `bytes32` handle) |
+| ACL allow (`FHE.allow(...)`) | ownership and observer grants accumulated from on-chain transactions; enforced by the coprocessor's read path |
+| user decryption (`fhevm.userDecrypt(...)`) | `client.balance(account)` / `client.frozen(account)` — threshold-decrypts through the ACL, errors cleanly when not granted |
+| decryption oracle callback | the request/fulfillment cycle: every entry point emits a request event; the operator posts one bound fulfillment transaction per request, in order |
+| symbolic execution on ciphertext handles | none — each request maps to one `fhe::token` operation executed by the coprocessor |
+| KMS / threshold network | the in-process N-of-N `fhe::gateway::Committee` (networked MPC is a named future goal) |
+
 ## Public checks stay public
 
 Role checks (agent/freezer) and public policy (pause, blocklist,
@@ -48,7 +95,7 @@ than re-implementing their circuits.
 Ciphertexts never enter calldata: a degree-16384 ciphertext is megabytes
 and the chain carries only 32-byte values. A user submits an encrypted
 amount (a serialized `FheUint64`) to the coprocessor **off-chain**
-(`Coprocessor::register_input` via `Service::register_and_anchor`),
+(`Client::encrypt_input`, which encrypts, registers, and anchors),
 which validates it against the deployment parameters, stores the bytes,
 anchors `(handle, commitment = keccak256(bytes), owner)` on-chain with
 `registerInput`, and returns the handle. The user's transaction then
@@ -125,13 +172,39 @@ Known v1 scope cuts, also deliberate:
 |---|---|---|
 | `faucet` | credits `publicBalance` | mirrors the public ledger |
 | `wrap` | public-balance check + debit | confidential mint (+ observer grant) |
-| `transfer` | pause, blocklist, identity, input ownership | freezable double-guard transfer, observer grants |
+| `confidentialTransfer` | pause, blocklist, identity, input ownership | freezable double-guard transfer, observer grants |
 | `setObserver` | own account only (`msg.sender`) | mirrors the observer registry |
-| `setVerified` / `setBlocked` / `setPaused` | agent role; takes effect on-chain | mirrors policy state |
+| `setVerified` / `blockUser`/`unblockUser` / `pause`/`unpause` | agent role; takes effect on-chain | mirrors policy state |
 | `setConfidentialFrozen` | agent role, input ownership | stores the encrypted frozen amount |
-| `forceTransfer` | agent role | core-circuit transfer (balance guard only) |
+| `forceConfidentialTransferFrom` | agent role | core-circuit transfer (balance guard only; unlike OZ, moves frozen funds too — see below) |
 | `recover` | agent role | full-balance move, frozen carried as encrypted `min` |
-| `requestUnwrap` | input ownership | threshold-decrypts the amount (by design), credits `publicBalance` on success via the fulfillment |
+| `unwrap` | input ownership | threshold-decrypts the amount (by design), credits `publicBalance` on success via the fulfillment |
+
+### Divergences from OZ ERC7984, named
+
+The external surface follows OpenZeppelin's confidential-contracts
+naming (`confidentialTransfer`, `confidentialBalanceOf`,
+`confidentialFrozen`, `setConfidentialFrozen`, `wrap`/`unwrap`,
+`blockUser`/`unblockUser`, `pause`/`unpause`, `isVerified`), with these
+deliberate divergences:
+
+- **`forceConfidentialTransferFrom` moves frozen funds.** OZ's version
+  keeps the frozen guard (frozen tokens must be unfrozen first); the
+  kit's `Rwa::force_transfer` bypasses it by design, and only the
+  encrypted balance guard applies. Same name, different compliance
+  semantics — flagged here and in the contract natspec.
+- **`bytes32` handles instead of `externalEuint64 + inputProof`** —
+  the transport split (see above); input proofs are the named
+  TODO-by-trust-model.
+- **No `confidentialTotalSupply`, operators
+  (`confidentialTransferFrom`/`setOperator`), or token metadata** —
+  supply is not tracked on-chain (the faucet is a test stand-in) and
+  `msg.sender` IS the account, so operator-style delegation is out of
+  scope.
+- **`confidentialTransfer` reverts `NoBalance` for a never-funded
+  sender** where OZ would silently zero; the kit requires an existing
+  balance handle, and the revert (a public "never funded" signal) keeps
+  the coprocessor from processing unfundable transfers.
 
 Latency of the request-tx → fulfillment-tx round trip is measured by the
 e2e harness; see the "On-chain gateway" section of `BENCHMARKS.md`.
