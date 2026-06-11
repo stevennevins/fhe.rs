@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use alloy::primitives::{Address, B256, keccak256};
 use fhe::bfv::BfvParameters;
-use fhe::gateway::Committee;
+use fhe::gateway::{Committee, CompareTranscript};
 use fhe::token::ConfidentialToken;
 use fhe::token::extensions::observer::Observers;
 use fhe::token::extensions::rwa::Rwa;
@@ -18,8 +18,53 @@ use fhe_traits::{DeserializeParametrized, Serialize};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-use crate::requests::{Fulfillment, HandleCommitment, Request};
+use crate::requests::{Fulfillment, HandleCommitment, Request, ops, types};
 use crate::{Error, Result};
+
+/// The version byte (31) of a symbolic handle.
+const HANDLE_VERSION: u8 = 0;
+
+/// The symbolic result handle, exactly as the contract derives it:
+/// keccak over a domain tag, the op, its inputs, the request id, and
+/// the op's index within the request, with the fhEVM-style trailing
+/// bytes written in — byte 21 = 0xff (computed marker), byte 30 = the
+/// type tag, byte 31 = the version. The coprocessor re-derives this
+/// and refuses to materialize a mismatch.
+#[must_use]
+pub fn symbolic_handle(
+    op: u8,
+    lhs: B256,
+    rhs: B256,
+    cond: B256,
+    id: u64,
+    index: u32,
+    type_tag: u8,
+) -> B256 {
+    let mut preimage = Vec::with_capacity(10 + 1 + 96 + 8 + 4);
+    preimage.extend_from_slice(b"fhe.rs/sym");
+    preimage.push(op);
+    preimage.extend_from_slice(lhs.as_slice());
+    preimage.extend_from_slice(rhs.as_slice());
+    preimage.extend_from_slice(cond.as_slice());
+    preimage.extend_from_slice(&id.to_be_bytes());
+    preimage.extend_from_slice(&index.to_be_bytes());
+    let mut handle = keccak256(&preimage);
+    handle.0[21] = 0xff;
+    handle.0[30] = type_tag;
+    handle.0[31] = HANDLE_VERSION;
+    handle
+}
+
+/// The result type of a symbolic op: comparisons yield ebool,
+/// everything else euint64.
+#[must_use]
+pub fn op_result_type(op: u8) -> u8 {
+    if op == ops::GE {
+        types::EBOOL
+    } else {
+        types::EUINT64
+    }
+}
 
 /// A ciphertext the coprocessor stores on behalf of the chain: the
 /// serialized bytes and the keccak256 commitment anchored on-chain.
@@ -62,6 +107,9 @@ pub struct Coprocessor {
     /// The mirror of the contract's `observerOf`, by address, for the
     /// observer grants written at handle rotation.
     observer_of: HashMap<Address, Address>,
+    /// Comparison transcripts of symbolic `ge` ops, for the same
+    /// single-party-view leakage sweeps as the token's audit logs.
+    op_compares: Vec<CompareTranscript>,
     rng: ChaCha20Rng,
     handle_nonce: u64,
 }
@@ -89,6 +137,7 @@ impl Coprocessor {
             store: HashMap::new(),
             acl: HashMap::new(),
             observer_of: HashMap::new(),
+            op_compares: Vec::new(),
             rng,
             handle_nonce: 0,
         })
@@ -117,6 +166,14 @@ impl Coprocessor {
     #[must_use]
     pub fn ledger(&self) -> &PublicLedger {
         &self.ledger
+    }
+
+    /// The comparison transcripts of every symbolic `ge` executed, in
+    /// request order — the audit log the Goal D leakage sweeps run
+    /// over for the symbolic alphabet.
+    #[must_use]
+    pub fn op_compares(&self) -> &[CompareTranscript] {
+        &self.op_compares
     }
 
     /// The kit account bound to `address`, assigned on first sight.
@@ -481,6 +538,40 @@ impl Coprocessor {
                     }
                 }
             }
+            Request::SymbolicOp {
+                id,
+                caller,
+                op,
+                lhs,
+                rhs,
+                cond,
+                result,
+            } => {
+                // Re-derive the contract's symbolic handle: the chain
+                // and the executor must agree on what is being bound.
+                let derived = symbolic_handle(op, lhs, rhs, cond, id, 0, op_result_type(op));
+                if derived != result {
+                    return Err(Error::State(format!(
+                        "request {id}: symbolic handle mismatch (chain {result}, derived {derived})"
+                    )));
+                }
+                let output = self.execute_symbolic(op, lhs, rhs, cond)?;
+                let bytes = output.to_bytes();
+                let commitment = keccak256(&bytes);
+                self.store
+                    .insert(result, StoredCiphertext { bytes, commitment });
+                self.allow_mirror(result, caller);
+                Ok(Fulfillment::Op {
+                    id,
+                    caller,
+                    op,
+                    lhs,
+                    rhs,
+                    cond,
+                    result,
+                    commitment,
+                })
+            }
             // Already authorized and written on-chain (chain of custody
             // checked by the contract); mirrored here in request order.
             Request::Allow {
@@ -526,6 +617,49 @@ impl Coprocessor {
             .token
             .committee()
             .threshold_decrypt(&ciphertext, &mut self.rng)?)
+    }
+
+    /// Executes one symbolic op over the stored ciphertexts. Encrypted
+    /// semantics never error: `ge` always yields an encrypted bit and
+    /// `select` always blends — only a structurally missing operand
+    /// (a chain/mirror inconsistency) propagates.
+    fn execute_symbolic(&mut self, op: u8, lhs: B256, rhs: B256, cond: B256) -> Result<FheUint64> {
+        let a = self.ciphertext_of(lhs)?;
+        let b = self.ciphertext_of(rhs)?;
+        match op {
+            ops::ADD => Ok(&a + &b),
+            ops::SUB => Ok(&a - &b),
+            ops::GE => {
+                let (bit, transcript) =
+                    self.token
+                        .committee()
+                        .compare_ge_with_transcript(&a, &b, &mut self.rng)?;
+                self.op_compares.push(transcript);
+                Ok(bit)
+            }
+            ops::SELECT => {
+                let condition = self.ciphertext_of(cond)?;
+                Ok(fhe::typed::safe_math::select(&condition, &a, &b))
+            }
+            _ => Err(Error::State(format!(
+                "unknown symbolic op {op} (the contract validates the alphabet)"
+            ))),
+        }
+    }
+
+    /// The ciphertext behind any stored handle (input, rotation output,
+    /// or materialized symbolic result), integrity-checked.
+    fn ciphertext_of(&self, handle: B256) -> Result<FheUint64> {
+        if !self.verify_stored(handle) {
+            return Err(Error::State(format!(
+                "stored bytes behind {handle} no longer match their commitment"
+            )));
+        }
+        let stored = self
+            .store
+            .get(&handle)
+            .ok_or_else(|| Error::State(format!("no ciphertext stored behind handle {handle}")))?;
+        Ok(FheUint64::from_bytes(&stored.bytes, &self.params)?)
     }
 
     /// Mirrors one on-chain `Allowed` grant: `who` may read `handle`.

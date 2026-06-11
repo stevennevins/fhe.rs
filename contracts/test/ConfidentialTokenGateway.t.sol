@@ -22,6 +22,14 @@ contract ConfidentialTokenGatewayTest {
 
     ConfidentialTokenGateway internal gateway;
 
+    // Mirrors of the gateway's symbolic-op constants (a getter call
+    // would consume vm.prank); pinned against the contract in
+    // testSymbolicConstantsMatch.
+    uint8 internal constant SOP_ADD = 1;
+    uint8 internal constant SOP_GE = 3;
+    uint8 internal constant SOP_SELECT = 4;
+    uint8 internal constant TYPE_EBOOL = 0;
+
     function setUp() public {
         gateway = new ConfidentialTokenGateway(AGENT, COPROCESSOR);
     }
@@ -176,6 +184,124 @@ contract ConfidentialTokenGatewayTest {
         require(gateway.isAllowed(newFrozen, ALICE), "account reads its frozen amount");
         require(gateway.isAllowed(newFrozen, AGENT), "freezer reads it too");
         require(!gateway.isAllowed(newFrozen, BOB), "stranger denied");
+    }
+
+    // ------------------------------------------------------------------
+    // Symbolic ops (Goal H2): derivation, authorization, deferred
+    // binding.
+    // ------------------------------------------------------------------
+
+    /// @dev The documented derivation, recomputed independently.
+    function _expectedSymbolicHandle(
+        uint8 op,
+        bytes32 lhs,
+        bytes32 rhs,
+        bytes32 cond,
+        uint64 id,
+        uint32 index,
+        uint8 typeTag
+    ) internal pure returns (bytes32) {
+        uint256 h = uint256(keccak256(abi.encodePacked("fhe.rs/sym", op, lhs, rhs, cond, id, index)));
+        h = (h & ~(uint256(0xff) << 80)) | (uint256(0xff) << 80);
+        h = (h & ~(uint256(0xff) << 8)) | (uint256(typeTag) << 8);
+        h = (h & ~uint256(0xff));
+        return bytes32(h); // version byte 31 is 0
+    }
+
+    function testSymbolicConstantsMatch() public view {
+        require(gateway.SOP_ADD() == SOP_ADD, "SOP_ADD");
+        require(gateway.SOP_GE() == SOP_GE, "SOP_GE");
+        require(gateway.SOP_SELECT() == SOP_SELECT, "SOP_SELECT");
+        require(gateway.TYPE_EBOOL() == TYPE_EBOOL, "TYPE_EBOOL");
+        require(gateway.TYPE_EUINT64() == 5, "TYPE_EUINT64");
+        require(gateway.HANDLE_VERSION() == 0, "HANDLE_VERSION");
+        require(gateway.SOP_SUB() == 2, "SOP_SUB");
+    }
+
+    function testRequestOpDerivesTheDocumentedHandle() public {
+        bytes32 x = keccak256("x");
+        bytes32 y = keccak256("y");
+        _registerInput(x, ALICE);
+        _registerInput(y, ALICE);
+        uint64 id = gateway.nextRequestId();
+        vm.prank(ALICE);
+        bytes32 result = gateway.requestOp(SOP_GE, x, y, bytes32(0));
+        require(
+            result == _expectedSymbolicHandle(SOP_GE, x, y, bytes32(0), id, 0, TYPE_EBOOL),
+            "ge handle derivation"
+        );
+        require(uint8(result[21]) == 0xff, "computed marker byte");
+        require(uint8(result[30]) == TYPE_EBOOL, "type tag byte");
+        require(uint8(result[31]) == 0, "version byte");
+        require(gateway.isAllowed(result, ALICE), "caller allowed on result");
+    }
+
+    function testRequestOpRequiresAllowedOperands() public {
+        bytes32 x = keccak256("x");
+        bytes32 y = keccak256("y");
+        _registerInput(x, ALICE);
+        _registerInput(y, ALICE);
+        // Bob is not allowed on alice's inputs.
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.NotAllowed.selector, x, BOB));
+        gateway.requestOp(SOP_ADD, x, y, bytes32(0));
+        // A never-created handle has no grants: same revert.
+        vm.prank(ALICE);
+        vm.expectRevert();
+        gateway.requestOp(SOP_ADD, x, keccak256("never"), bytes32(0));
+    }
+
+    function testRequestOpArityAndTypeChecks() public {
+        bytes32 x = keccak256("x");
+        bytes32 y = keccak256("y");
+        _registerInput(x, ALICE);
+        _registerInput(y, ALICE);
+        // cond must be zero for two-operand ops.
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.WrongArity.selector, SOP_ADD));
+        gateway.requestOp(SOP_ADD, x, y, x);
+        // select's cond must be an ebool, not a euint64 input.
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.WrongOperandType.selector, x));
+        gateway.requestOp(SOP_SELECT, x, y, x);
+        // an ebool result is not a euint64 operand.
+        vm.prank(ALICE);
+        bytes32 bit = gateway.requestOp(SOP_GE, x, y, bytes32(0));
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.WrongOperandType.selector, bit));
+        gateway.requestOp(SOP_ADD, bit, y, bytes32(0));
+        // the alphabet is closed.
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.UnknownOp.selector, uint8(99)));
+        gateway.requestOp(99, x, y, bytes32(0));
+    }
+
+    function testOpCommitmentIsDeferredAndChainingWorksBeforeIt() public {
+        bytes32 x = keccak256("x");
+        bytes32 y = keccak256("y");
+        _registerInput(x, ALICE);
+        _registerInput(y, ALICE);
+        vm.prank(ALICE);
+        bytes32 bit = gateway.requestOp(SOP_GE, x, y, bytes32(0));
+        uint64 geId = gateway.nextRequestId() - 1;
+        // The promise: no commitment yet.
+        require(gateway.handleCommitment(bit) == bytes32(0), "commitment deferred");
+        // Chaining on the unmaterialized result is the point: select
+        // over it in a later transaction, before any fulfillment.
+        vm.prank(ALICE);
+        bytes32 picked = gateway.requestOp(SOP_SELECT, x, y, bit);
+        uint64 selectId = gateway.nextRequestId() - 1;
+        // Fulfillment binds in order, with the echoed request payload.
+        vm.prank(COPROCESSOR);
+        vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.RequestMismatch.selector, geId));
+        gateway.fulfillOp(geId, ALICE, SOP_GE, x, y, bytes32(0), keccak256("wrong"), bytes32(uint256(7)));
+        vm.prank(COPROCESSOR);
+        gateway.fulfillOp(geId, ALICE, SOP_GE, x, y, bytes32(0), bit, bytes32(uint256(7)));
+        require(gateway.handleCommitment(bit) == bytes32(uint256(7)), "deferred binding posted");
+        vm.prank(COPROCESSOR);
+        gateway.fulfillOp(selectId, ALICE, SOP_SELECT, x, y, bit, picked, bytes32(uint256(8)));
+        require(gateway.handleCommitment(picked) == bytes32(uint256(8)), "second binding posted");
+        require(gateway.lastFulfilledId() == selectId, "both fulfilled in order");
     }
 
     function testRolesAreSetAtDeploy() public view {

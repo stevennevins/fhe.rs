@@ -524,6 +524,34 @@ async fn onchain_e2e() {
         assert_eq!(audits.get(1).unwrap().amount, 1_000_000);
     }
 
+    eprintln!("e2e: step 10");
+    // Step 10 (Goal H2): a symbolic ge + select composition at
+    // production parameters — the chain derives both result handles
+    // before any FHE work, the coprocessor materializes them in order,
+    // and the composition decrypts to the reference value through the
+    // same ACL-checked read path as balances.
+    let mut raw_sym: Vec<(u64, u64)> = Vec::new();
+    {
+        let bid_a = as_alice.encrypt_input(7_000).await.unwrap();
+        let bid_b = as_alice.encrypt_input(9_500).await.unwrap();
+        let a_wins = as_alice.ge(bid_a, bid_b).await.unwrap();
+        raw_sym.push((7_000, 9_500));
+        let winning = as_alice.select(a_wins, bid_a, bid_b).await.unwrap();
+        assert_eq!(as_alice.decrypt(a_wins).await.unwrap(), 0);
+        assert_eq!(as_alice.decrypt(winning).await.unwrap(), 9_500);
+        // The deferred commitment landed and binds the stored bytes.
+        for handle in [a_wins, winning] {
+            let commitment = gateway.handleCommitment(handle).call().await.unwrap();
+            let state = operator.state().await;
+            assert_eq!(
+                alloy::primitives::keccak256(state.stored_bytes(handle).unwrap()),
+                commitment
+            );
+        }
+        // The never-granted intruder is denied on symbolic results too.
+        assert!(as_intruder.decrypt(winning).await.is_err());
+    }
+
     // Final leakage sweep (d): the Goal D/E single-party-view
     // assertions over EVERY comparison and refresh the lifecycle
     // performed, against the reference model's raw operands.
@@ -546,6 +574,14 @@ async fn onchain_e2e() {
             for refresh in &audit.refreshes {
                 assert_refresh_hides(refresh, &[*balance, *frozen, *amount]);
             }
+        }
+        // The symbolic alphabet's comparisons get the same sweep
+        // (Goal H2): compositions, not just single ops, leak nothing
+        // beyond the documented blinded difference.
+        let op_log = state.op_compares();
+        assert_eq!(op_log.len(), raw_sym.len());
+        for (compare, (lhs, rhs)) in op_log.iter().zip(&raw_sym) {
+            assert_compare_hides(compare, *lhs, *rhs);
         }
     }
 

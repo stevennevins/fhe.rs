@@ -30,12 +30,14 @@ use tokio::sync::Mutex;
 use crate::abi::IConfidentialTokenGateway::{self as gw, IConfidentialTokenGatewayInstance};
 use crate::coprocessor::Coprocessor;
 use crate::harness::wait_receipt;
+use crate::requests::ops;
 use crate::{Error, Result, chain_err};
 
 /// Every request event's signature hash; the request id is `topics[1]`
 /// in all of them.
-const REQUEST_EVENTS: [B256; 12] = [
+const REQUEST_EVENTS: [B256; 13] = [
     gw::AllowRequested::SIGNATURE_HASH,
+    gw::OpRequested::SIGNATURE_HASH,
     gw::FaucetRequested::SIGNATURE_HASH,
     gw::WrapRequested::SIGNATURE_HASH,
     gw::TransferRequested::SIGNATURE_HASH,
@@ -51,7 +53,8 @@ const REQUEST_EVENTS: [B256; 12] = [
 
 /// Every fulfillment event's signature hash; the fulfilled request id
 /// is `topics[1]` in all of them.
-const FULFILLMENT_EVENTS: [B256; 6] = [
+const FULFILLMENT_EVENTS: [B256; 7] = [
+    gw::OpFulfilled::SIGNATURE_HASH,
     gw::RequestAcked::SIGNATURE_HASH,
     gw::WrapFulfilled::SIGNATURE_HASH,
     gw::TransferFulfilled::SIGNATURE_HASH,
@@ -207,6 +210,54 @@ impl Client {
         transact!(self, self.gateway.allow(handle, account)).map(drop)
     }
 
+    // ------------------------------------------------------------------
+    // Symbolic encrypted ops (the fhEVM `FHE.add`/`FHE.ge`/... shape).
+    // Each returns the RESULT handle, which is usable in further ops
+    // immediately; the method resolves when the op materializes.
+    // ------------------------------------------------------------------
+
+    /// Requests one symbolic op over handles this caller is allowed
+    /// on. `cond` is the select condition (zero for two-operand ops).
+    /// Errors are public-check reverts: unknown op, wrong arity or
+    /// operand type, an operand the ACL does not allow.
+    pub async fn request_op(&self, op: u8, lhs: B256, rhs: B256, cond: B256) -> Result<B256> {
+        let log = transact!(self, self.gateway.requestOp(op, lhs, rhs, cond))?;
+        let event = log
+            .log_decode::<gw::OpFulfilled>()
+            .map_err(chain_err)?
+            .inner
+            .data;
+        Ok(event.result)
+    }
+
+    /// Symbolic `lhs + rhs` (euint64).
+    pub async fn add(&self, lhs: B256, rhs: B256) -> Result<B256> {
+        self.request_op(ops::ADD, lhs, rhs, B256::ZERO).await
+    }
+
+    /// Symbolic `lhs - rhs` (euint64).
+    pub async fn sub(&self, lhs: B256, rhs: B256) -> Result<B256> {
+        self.request_op(ops::SUB, lhs, rhs, B256::ZERO).await
+    }
+
+    /// Symbolic `lhs >= rhs` (ebool). Operands must be below 2^40 (the
+    /// committee's comparison bound) — a documented precondition on
+    /// encrypted values that cannot be checked.
+    pub async fn ge(&self, lhs: B256, rhs: B256) -> Result<B256> {
+        self.request_op(ops::GE, lhs, rhs, B256::ZERO).await
+    }
+
+    /// Symbolic `cond ? lhs : rhs` (euint64; `cond` is an ebool).
+    pub async fn select(&self, cond: B256, lhs: B256, rhs: B256) -> Result<B256> {
+        self.request_op(ops::SELECT, lhs, rhs, cond).await
+    }
+
+    /// Decrypts any on-chain handle this client's address is allowed
+    /// on — the same ACL-checked read path as [`Client::balance`].
+    pub async fn decrypt(&self, handle: B256) -> Result<u64> {
+        self.state.lock().await.decrypt_for(handle, self.address)
+    }
+
     /// Marks `account` (un)verified in the identity registry
     /// (agent-only).
     pub async fn set_verified(&self, account: Address, verified: bool) -> Result<()> {
@@ -271,7 +322,7 @@ impl Client {
             .call()
             .await
             .map_err(chain_err)?;
-        self.decrypt(handle, account, "balance").await
+        self.read_current(handle, account, "balance").await
     }
 
     /// Decrypts `account`'s confidential frozen amount as this client.
@@ -282,7 +333,7 @@ impl Client {
             .call()
             .await
             .map_err(chain_err)?;
-        self.decrypt(handle, account, "frozen amount").await
+        self.read_current(handle, account, "frozen amount").await
     }
 
     /// `account`'s public ERC20-side balance (a plain view call).
@@ -294,8 +345,9 @@ impl Client {
             .map_err(chain_err)
     }
 
-    /// The ACL-enforced read path over an on-chain handle.
-    async fn decrypt(&self, handle: B256, account: Address, what: &str) -> Result<u64> {
+    /// The ACL-enforced read path over an account's current handle,
+    /// with a clean error when the account has none.
+    async fn read_current(&self, handle: B256, account: Address, what: &str) -> Result<u64> {
         if handle == B256::ZERO {
             return Err(Error::State(format!(
                 "account {account} has no confidential {what}"

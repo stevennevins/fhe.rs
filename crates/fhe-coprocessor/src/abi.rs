@@ -43,6 +43,7 @@ sol! {
         function recover(address lost, address recipient) external;
         function unwrap(bytes32 amountHandle) external;
         function allow(bytes32 handle, address account) external;
+        function requestOp(uint8 op, bytes32 lhs, bytes32 rhs, bytes32 cond) external returns (bytes32 result);
 
         function registerInput(bytes32 handle, bytes32 commitment, address owner) external;
         function fulfillAck(uint64 id) external;
@@ -83,6 +84,16 @@ sol! {
             bytes32 newRecipientFrozenHandle,
             bytes32 newRecipientFrozenCommitment
         ) external;
+        function fulfillOp(
+            uint64 id,
+            address caller,
+            uint8 op,
+            bytes32 lhs,
+            bytes32 rhs,
+            bytes32 cond,
+            bytes32 result,
+            bytes32 commitment
+        ) external;
         function fulfillUnwrap(
             uint64 id,
             address account,
@@ -105,6 +116,15 @@ sol! {
         event RecoverRequested(uint64 indexed id, address indexed lost, address indexed recipient);
         event UnwrapRequested(uint64 indexed id, address indexed account, bytes32 amountHandle);
         event AllowRequested(uint64 indexed id, bytes32 indexed handle, address indexed account);
+        event OpRequested(
+            uint64 indexed id,
+            address indexed caller,
+            uint8 op,
+            bytes32 lhs,
+            bytes32 rhs,
+            bytes32 cond,
+            bytes32 result
+        );
         event InputRegistered(bytes32 indexed handle, bytes32 commitment, address indexed owner);
         event Allowed(bytes32 indexed handle, address indexed account);
 
@@ -147,6 +167,11 @@ sol! {
         error OutOfOrderFulfillment(uint64 id, uint64 expected);
         error RequestMismatch(uint64 id);
         error HandleAlreadyAnchored(bytes32 handle);
+        event OpFulfilled(uint64 indexed id, bytes32 indexed result);
+
         error NotAllowed(bytes32 handle, address account);
+        error UnknownOp(uint8 op);
+        error WrongArity(uint8 op);
+        error WrongOperandType(bytes32 handle);
     }
 }

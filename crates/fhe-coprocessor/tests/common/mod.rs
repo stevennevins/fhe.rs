@@ -1,11 +1,38 @@
 //! Shared devnet setup for the on-chain tests: spawn anvil, connect
-//! wallet-backed websocket providers, deploy the gateway.
+//! wallet-backed websocket providers, deploy the gateway. Also the
+//! Goal D single-party-view leakage assertion, shared by the tests
+//! that sweep audit transcripts.
 
 use alloy::node_bindings::{Anvil, AnvilInstance};
 use alloy::primitives::Address;
 use alloy::providers::DynProvider;
 use alloy::signers::local::PrivateKeySigner;
+use fhe::gateway::CompareTranscript;
 use fhe_coprocessor::harness;
+
+/// The Goal D single-party-view assertions over one comparison
+/// transcript, against the raw operands the reference model knows
+/// (the same sweep `onchain_e2e.rs` runs over the token audit logs).
+#[allow(dead_code)] // not every test in the suite sweeps transcripts
+pub fn assert_compare_hides(compare: &CompareTranscript, lhs: u64, rhs: u64) {
+    let true_difference = lhs.wrapping_sub(rhs);
+    let revealed = compare.revealed;
+    assert_ne!(revealed, lhs);
+    assert_ne!(revealed, rhs);
+    if true_difference != 0 {
+        assert_ne!(revealed, true_difference);
+        for blind in &compare.blinds {
+            assert!(*blind >= 3);
+            let partially_unblinded = (revealed as i64).unsigned_abs() / blind;
+            let residual = if (revealed as i64) < 0 {
+                (partially_unblinded as i64).wrapping_neg() as u64
+            } else {
+                partially_unblinded
+            };
+            assert_ne!(residual, true_difference);
+        }
+    }
+}
 
 /// One devnet account: a wallet-backed provider and its address.
 pub struct Wallet {

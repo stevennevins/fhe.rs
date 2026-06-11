@@ -10,6 +10,26 @@ use alloy::sol_types::SolEvent;
 use crate::abi::IConfidentialTokenGateway as gw;
 use crate::{Result, chain_err};
 
+/// The symbolic-op alphabet, matching the contract's `SOP_*` constants.
+pub mod ops {
+    /// `lhs + rhs` (euint64; wraps mod 2^64 like the kit's `Add`).
+    pub const ADD: u8 = 1;
+    /// `lhs - rhs` (euint64; wraps mod 2^64 like the kit's `Sub`).
+    pub const SUB: u8 = 2;
+    /// `lhs >= rhs` (ebool; operands below 2^40, the committee bound).
+    pub const GE: u8 = 3;
+    /// `cond ? lhs : rhs` (euint64; `cond` is an ebool).
+    pub const SELECT: u8 = 4;
+}
+
+/// fhEVM-style type tags carried in a symbolic handle's byte 30.
+pub mod types {
+    /// An encrypted boolean (a comparison result).
+    pub const EBOOL: u8 = 0;
+    /// An encrypted 64-bit integer.
+    pub const EUINT64: u8 = 5;
+}
+
 /// A decoded request event, in the order its id assigns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -114,6 +134,26 @@ pub enum Request {
         /// Registered input handle of the encrypted amount.
         amount_handle: B256,
     },
+    /// One symbolic encrypted op: the result handle was derived
+    /// on-chain before the ciphertext exists; the coprocessor
+    /// materializes it and posts the deferred commitment.
+    SymbolicOp {
+        /// Request id.
+        id: u64,
+        /// The requesting caller (allowed on every operand; granted on
+        /// the result).
+        caller: Address,
+        /// The op tag ([`ops`]).
+        op: u8,
+        /// Left operand handle.
+        lhs: B256,
+        /// Right operand handle.
+        rhs: B256,
+        /// Select condition handle (zero for two-operand ops).
+        cond: B256,
+        /// The contract-derived symbolic result handle.
+        result: B256,
+    },
     /// ACL grant (already authorized and written on-chain; mirrored
     /// into the coprocessor's read path in request order).
     Allow {
@@ -142,6 +182,7 @@ impl Request {
             | Self::ForceTransfer { id, .. }
             | Self::Recover { id, .. }
             | Self::Unwrap { id, .. }
+            | Self::SymbolicOp { id, .. }
             | Self::Allow { id, .. } => *id,
         }
     }
@@ -229,6 +270,17 @@ impl Request {
                 id: e.id,
                 account: e.account,
                 amount_handle: e.amountHandle,
+            }
+        } else if *topic == gw::OpRequested::SIGNATURE_HASH {
+            let e = decode::<gw::OpRequested>(log)?;
+            Self::SymbolicOp {
+                id: e.id,
+                caller: e.caller,
+                op: e.op,
+                lhs: e.lhs,
+                rhs: e.rhs,
+                cond: e.cond,
+                result: e.result,
             }
         } else if *topic == gw::AllowRequested::SIGNATURE_HASH {
             let e = decode::<gw::AllowRequested>(log)?;
@@ -322,6 +374,27 @@ pub enum Fulfillment {
         /// The recipient's rotated frozen amount.
         new_recipient_frozen: HandleCommitment,
     },
+    /// A symbolic op materialized: the deferred commitment for its
+    /// contract-derived result handle.
+    Op {
+        /// Request id.
+        id: u64,
+        /// The requesting caller (echoed for the request binding).
+        caller: Address,
+        /// The op tag (echoed for the request binding).
+        op: u8,
+        /// Left operand (echoed for the request binding).
+        lhs: B256,
+        /// Right operand (echoed for the request binding).
+        rhs: B256,
+        /// Select condition (echoed for the request binding).
+        cond: B256,
+        /// The symbolic result handle (echoed for the request binding).
+        result: B256,
+        /// keccak256 of the materialized ciphertext — the deferred
+        /// binding posted at fulfillment.
+        commitment: B256,
+    },
     /// An unwrap landed (successfully or not — both are public).
     Unwrap {
         /// Request id.
@@ -350,6 +423,7 @@ impl Fulfillment {
             | Self::Transfer { id, .. }
             | Self::FrozenSet { id, .. }
             | Self::Recover { id, .. }
+            | Self::Op { id, .. }
             | Self::Unwrap { id, .. } => *id,
         }
     }

@@ -79,7 +79,7 @@ contract ConfidentialTokenGateway {
     mapping(address => address) public observerOf;
 
     /// @dev Request binding: op tag and payload hash per pending id.
-    mapping(uint64 => uint8) public requestOp;
+    mapping(uint64 => uint8) public requestOpTag;
     mapping(uint64 => bytes32) public requestHash;
 
     /// @dev Observer snapshots taken at REQUEST time for wraps and
@@ -102,6 +102,32 @@ contract ConfidentialTokenGateway {
     uint8 public constant OP_RECOVER = 10;
     uint8 public constant OP_UNWRAP = 11;
     uint8 public constant OP_ALLOW = 12;
+    uint8 public constant OP_SYMBOLIC = 13;
+
+    // ------------------------------------------------------------------
+    // Symbolic encrypted ops (Goal H2): a small fixed alphabet over
+    // ACL-allowed handles, with the RESULT handle derived on-chain
+    // before its ciphertext exists. The handle is a promise: its
+    // `handleCommitment` is posted at fulfillment (deferred binding —
+    // a documented weakening of anchor-at-mint, see the docs).
+    // ------------------------------------------------------------------
+    uint8 public constant SOP_ADD = 1;
+    uint8 public constant SOP_SUB = 2;
+    uint8 public constant SOP_GE = 3;
+    uint8 public constant SOP_SELECT = 4;
+
+    /// @notice fhEVM-style type tags carried in a symbolic handle's
+    /// byte 30 (`ebool` = 0, `euint64` = 5, as in FhevmHandle).
+    uint8 public constant TYPE_EBOOL = 0;
+    uint8 public constant TYPE_EUINT64 = 5;
+    /// @notice Symbolic handle version, carried in byte 31.
+    uint8 public constant HANDLE_VERSION = 0;
+
+    /// @dev Type tag + 1 per symbolic result handle (0 = not symbolic).
+    /// The deterministic type source for operand checks; the trailing
+    /// bytes of the handle mirror it for off-chain readers. Anchored
+    /// inputs and fulfillment outputs are euint64 by construction.
+    mapping(bytes32 => uint8) private symbolicType;
 
     // ------------------------------------------------------------------
     // Request events (decoded by the coprocessor, processed in id order).
@@ -118,6 +144,15 @@ contract ConfidentialTokenGateway {
     event RecoverRequested(uint64 indexed id, address indexed lost, address indexed recipient);
     event UnwrapRequested(uint64 indexed id, address indexed account, bytes32 amountHandle);
     event AllowRequested(uint64 indexed id, bytes32 indexed handle, address indexed account);
+    event OpRequested(
+        uint64 indexed id,
+        address indexed caller,
+        uint8 op,
+        bytes32 lhs,
+        bytes32 rhs,
+        bytes32 cond,
+        bytes32 result
+    );
 
     /// @notice An encrypted input was anchored by the coprocessor.
     event InputRegistered(bytes32 indexed handle, bytes32 commitment, address indexed owner);
@@ -151,6 +186,7 @@ contract ConfidentialTokenGateway {
     event UnwrapFulfilled(
         uint64 indexed id, address indexed account, uint64 amount, bool success, bytes32 newBalanceHandle
     );
+    event OpFulfilled(uint64 indexed id, bytes32 indexed result);
 
     error NotAgent();
     error NotCoprocessor();
@@ -165,6 +201,9 @@ contract ConfidentialTokenGateway {
     error RequestMismatch(uint64 id);
     error HandleAlreadyAnchored(bytes32 handle);
     error NotAllowed(bytes32 handle, address account);
+    error UnknownOp(uint8 op);
+    error WrongArity(uint8 op);
+    error WrongOperandType(bytes32 handle);
 
     modifier onlyAgent() {
         if (msg.sender != agent) revert NotAgent();
@@ -221,6 +260,29 @@ contract ConfidentialTokenGateway {
         requestObserverFrom[id] = observerOf[msg.sender];
         requestObserverTo[id] = observerOf[to];
         emit TransferRequested(id, msg.sender, to, amountHandle);
+    }
+
+    /// @notice Requests one symbolic encrypted operation over handles
+    /// the caller is allowed on, returning the RESULT handle derived
+    /// deterministically here — before the ciphertext exists, so calls
+    /// may chain on it immediately (including within one transaction).
+    /// `cond` is the select condition (an ebool handle) and must be
+    /// zero for the two-operand ops. Encrypted semantics never revert:
+    /// a `select` on a failed `ge` fulfills with the same shape as a
+    /// successful one. Operand bound: `ge` compares values below 2^40
+    /// (the committee's comparison bound), a documented precondition
+    /// on encrypted values that cannot be checked here.
+    function requestOp(uint8 op, bytes32 lhs, bytes32 rhs, bytes32 cond)
+        external
+        returns (bytes32 result)
+    {
+        uint8 typeTag = _validateOp(op, lhs, rhs, cond);
+        uint64 id = nextRequestId;
+        result = _symbolicHandle(op, lhs, rhs, cond, id, 0, typeTag);
+        _request(OP_SYMBOLIC, abi.encode(msg.sender, op, lhs, rhs, cond, result));
+        symbolicType[result] = typeTag + 1;
+        _allow(result, msg.sender);
+        emit OpRequested(id, msg.sender, op, lhs, rhs, cond, result);
     }
 
     /// @notice Grants `account` read (decryption) access to `handle` —
@@ -356,7 +418,7 @@ contract ConfidentialTokenGateway {
         if (id != lastFulfilledId + 1 || id >= nextRequestId) {
             revert OutOfOrderFulfillment(id, lastFulfilledId + 1);
         }
-        uint8 op = requestOp[id];
+        uint8 op = requestOpTag[id];
         require(
             op == OP_FAUCET || op == OP_SET_OBSERVER || op == OP_SET_VERIFIED || op == OP_SET_BLOCKED
                 || op == OP_SET_PAUSED || op == OP_ALLOW,
@@ -401,7 +463,7 @@ contract ConfidentialTokenGateway {
         bytes32 transferredHandle,
         bytes32 transferredCommitment
     ) external onlyCoprocessor {
-        uint8 op = requestOp[id];
+        uint8 op = requestOpTag[id];
         if (op != OP_TRANSFER && op != OP_FORCE_TRANSFER) revert RequestMismatch(id);
         _fulfill(id, op, keccak256(abi.encode(from, to, amountHandle)));
         _rotate(from, newFromHandle, newFromCommitment);
@@ -491,13 +553,90 @@ contract ConfidentialTokenGateway {
         emit UnwrapFulfilled(id, account, amount, success, newBalanceHandle);
     }
 
+    /// @notice Fulfills a symbolic op: posts the result handle's
+    /// commitment — the DEFERRED binding. Until this lands, the result
+    /// handle is a coprocessor-signed promise; afterwards it is
+    /// hash-bound exactly like an anchored input.
+    function fulfillOp(
+        uint64 id,
+        address caller,
+        uint8 op,
+        bytes32 lhs,
+        bytes32 rhs,
+        bytes32 cond,
+        bytes32 result,
+        bytes32 commitment
+    ) external onlyCoprocessor {
+        _fulfill(id, OP_SYMBOLIC, keccak256(abi.encode(caller, op, lhs, rhs, cond, result)));
+        handleCommitment[result] = commitment;
+        emit OpFulfilled(id, result);
+    }
+
     // ------------------------------------------------------------------
     // Internals.
     // ------------------------------------------------------------------
 
+    /// @dev Public checks for one symbolic op (these DO revert — they
+    /// are public anyway): known op, right arity, caller allowed on
+    /// every operand, operand types match. Returns the result type.
+    function _validateOp(uint8 op, bytes32 lhs, bytes32 rhs, bytes32 cond)
+        internal
+        view
+        returns (uint8)
+    {
+        if (op == SOP_SELECT) {
+            _requireOperand(cond, TYPE_EBOOL);
+            _requireOperand(lhs, TYPE_EUINT64);
+            _requireOperand(rhs, TYPE_EUINT64);
+            return TYPE_EUINT64;
+        }
+        if (op == SOP_ADD || op == SOP_SUB || op == SOP_GE) {
+            if (cond != bytes32(0)) revert WrongArity(op);
+            _requireOperand(lhs, TYPE_EUINT64);
+            _requireOperand(rhs, TYPE_EUINT64);
+            return op == SOP_GE ? TYPE_EBOOL : TYPE_EUINT64;
+        }
+        revert UnknownOp(op);
+    }
+
+    /// @dev An operand is usable iff the ACL allows the caller on it
+    /// (which also proves the handle exists — every real handle has at
+    /// least one grant) and its type matches. A symbolic operand need
+    /// NOT be materialized yet: requests are fulfilled in order, so an
+    /// earlier result is available by the time this op executes.
+    function _requireOperand(bytes32 handle, uint8 wantType) internal view {
+        if (!isAllowed[handle][msg.sender]) revert NotAllowed(handle, msg.sender);
+        uint8 tagged = symbolicType[handle];
+        uint8 actual = tagged == 0 ? TYPE_EUINT64 : tagged - 1;
+        if (actual != wantType) revert WrongOperandType(handle);
+    }
+
+    /// @dev The symbolic result handle: keccak over a domain tag, the
+    /// op, its inputs, the request id, and the op's index within the
+    /// request, with the fhEVM-style trailing bytes written in — byte
+    /// 21 = 0xff (computed marker), byte 30 = type tag, byte 31 =
+    /// version. Anyone can recompute it; the coprocessor re-derives
+    /// and refuses a mismatch.
+    function _symbolicHandle(
+        uint8 op,
+        bytes32 lhs,
+        bytes32 rhs,
+        bytes32 cond,
+        uint64 id,
+        uint32 index,
+        uint8 typeTag
+    ) internal pure returns (bytes32) {
+        uint256 h =
+            uint256(keccak256(abi.encodePacked("fhe.rs/sym", op, lhs, rhs, cond, id, index)));
+        h = (h & ~(uint256(0xff) << 80)) | (uint256(0xff) << 80); // byte 21
+        h = (h & ~(uint256(0xff) << 8)) | (uint256(typeTag) << 8); // byte 30
+        h = (h & ~uint256(0xff)) | uint256(HANDLE_VERSION); // byte 31
+        return bytes32(h);
+    }
+
     function _request(uint8 op, bytes memory payload) internal returns (uint64 id) {
         id = nextRequestId++;
-        requestOp[id] = op;
+        requestOpTag[id] = op;
         requestHash[id] = keccak256(payload);
     }
 
@@ -513,9 +652,9 @@ contract ConfidentialTokenGateway {
         if (id != lastFulfilledId + 1 || id >= nextRequestId) {
             revert OutOfOrderFulfillment(id, lastFulfilledId + 1);
         }
-        if (requestOp[id] != op || requestHash[id] != payloadHash) revert RequestMismatch(id);
+        if (requestOpTag[id] != op || requestHash[id] != payloadHash) revert RequestMismatch(id);
         lastFulfilledId = id;
-        delete requestOp[id];
+        delete requestOpTag[id];
         delete requestHash[id];
     }
 

@@ -377,6 +377,16 @@ async fn send_fulfillment(
             new_recipient_frozen.handle,
             new_recipient_frozen.commitment,
         )),
+        Fulfillment::Op {
+            id,
+            caller,
+            op,
+            lhs,
+            rhs,
+            cond,
+            result,
+            commitment,
+        } => send!(gateway.fulfillOp(id, caller, op, lhs, rhs, cond, result, commitment)),
         Fulfillment::Unwrap {
             id,
             account,
