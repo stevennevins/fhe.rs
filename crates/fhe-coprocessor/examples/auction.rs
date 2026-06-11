@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .client(harness::connect(&ws, ann_key.clone()).await?, ann_address)
         .await;
     let ben = operator
-        .client(harness::connect(&ws, ben_key).await?, ben_address)
+        .client(harness::connect(&ws, ben_key.clone()).await?, ben_address)
         .await;
     let seller = operator
         .client(seller_provider.clone(), seller_address)
@@ -127,15 +127,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .get_receipt()
         .await?;
-    let as_seller = ISealedBidAuction::new(auction, seller_provider.clone());
-    // Ben submits through the seller's connection for brevity — the
-    // bid handle, not the submitting wallet, is what the auction binds.
-    as_seller
+    let as_ben = ISealedBidAuction::new(auction, harness::connect(&ws, ben_key).await?);
+    as_ben
         .submitBid(ben_bid)
         .send()
         .await?
         .get_receipt()
         .await?;
+    let as_seller = ISealedBidAuction::new(auction, seller_provider.clone());
     as_seller.settle().send().await?.get_receipt().await?;
 
     // The auction's calls are raw transactions (unlike Client methods,
