@@ -46,6 +46,138 @@ contract ConfidentialTokenGatewayTest {
         gateway.fulfillWrap(id, account, 1000, keccak256(abi.encode(account, "balance")), bytes32(uint256(1)));
     }
 
+    // ------------------------------------------------------------------
+    // On-chain ACL (Goal H1): grant-authorization rules.
+    // ------------------------------------------------------------------
+
+    function testRegisterInputGrantsOwnerOnAcl() public {
+        bytes32 handle = keccak256("input");
+        _registerInput(handle, ALICE);
+        require(gateway.isAllowed(handle, ALICE), "owner allowed");
+        require(!gateway.isAllowed(handle, BOB), "others not allowed");
+    }
+
+    function testAllowRequiresChainOfCustody() public {
+        bytes32 handle = keccak256("input");
+        _registerInput(handle, ALICE);
+        // A caller the ACL does not allow cannot grant.
+        vm.prank(BOB);
+        vm.expectRevert(
+            abi.encodeWithSelector(ConfidentialTokenGateway.NotAllowed.selector, handle, BOB)
+        );
+        gateway.allow(handle, BOB);
+        // The owner grants bob; bob may then grant onward.
+        vm.prank(ALICE);
+        gateway.allow(handle, BOB);
+        require(gateway.isAllowed(handle, BOB), "grantee allowed");
+        vm.prank(BOB);
+        gateway.allow(handle, address(0xCA401));
+        require(gateway.isAllowed(handle, address(0xCA401)), "second-hop grant");
+    }
+
+    function testAllowIsARequestAckedByTheCoprocessor() public {
+        bytes32 handle = keccak256("input");
+        _registerInput(handle, ALICE);
+        uint64 id = gateway.nextRequestId();
+        vm.prank(ALICE);
+        gateway.allow(handle, BOB);
+        require(gateway.nextRequestId() == id + 1, "allow assigns a request id");
+        vm.prank(COPROCESSOR);
+        gateway.fulfillAck(id);
+        require(gateway.lastFulfilledId() == id, "acked");
+    }
+
+    function testWrapFulfillmentGrantsAccountAndObserverSnapshot() public {
+        address observer = address(0x0B5);
+        vm.prank(ALICE);
+        gateway.setObserver(observer);
+        uint64 id = gateway.lastFulfilledId() + 1;
+        vm.prank(COPROCESSOR);
+        gateway.fulfillAck(id);
+        _fundConfidential(ALICE);
+        bytes32 balance = gateway.confidentialBalanceOf(ALICE);
+        require(gateway.isAllowed(balance, ALICE), "account allowed");
+        require(gateway.isAllowed(balance, observer), "observer allowed");
+        require(!gateway.isAllowed(balance, BOB), "stranger denied");
+    }
+
+    function testTransferGrantsUseTheRequestTimeObserverSnapshot() public {
+        _fundConfidential(ALICE);
+        _fundConfidential(BOB);
+        vm.prank(AGENT);
+        gateway.setVerified(BOB, true);
+        uint64 id = gateway.lastFulfilledId() + 1;
+        vm.prank(COPROCESSOR);
+        gateway.fulfillAck(id);
+
+        address lateObserver = address(0x1A7E);
+        bytes32 input = keccak256("amount");
+        _registerInput(input, ALICE);
+        vm.prank(ALICE);
+        gateway.confidentialTransfer(BOB, input);
+        uint64 transferId = gateway.nextRequestId() - 1;
+        // The observer set AFTER the request must not be granted at its
+        // fulfillment: the coprocessor mirrors observer state in request
+        // order, and the grant must match what it saw.
+        vm.prank(ALICE);
+        gateway.setObserver(lateObserver);
+
+        bytes32 newFrom = keccak256("newFrom");
+        bytes32 newTo = keccak256("newTo");
+        bytes32 moved = keccak256("moved");
+        vm.prank(COPROCESSOR);
+        gateway.fulfillTransfer(
+            transferId, ALICE, BOB, input, newFrom, bytes32(uint256(1)), newTo, bytes32(uint256(2)), moved, bytes32(uint256(3))
+        );
+        require(gateway.isAllowed(newFrom, ALICE), "sender on own balance");
+        require(gateway.isAllowed(newTo, BOB), "recipient on own balance");
+        require(gateway.isAllowed(moved, ALICE) && gateway.isAllowed(moved, BOB), "parties on amount");
+        require(!gateway.isAllowed(newFrom, lateObserver), "post-request observer not granted");
+        require(!gateway.isAllowed(newTo, ALICE), "sender not on recipient balance");
+    }
+
+    function testForceTransferGrantsNoObservers() public {
+        _fundConfidential(ALICE);
+        _fundConfidential(BOB);
+        address observer = address(0x0B5);
+        vm.prank(ALICE);
+        gateway.setObserver(observer);
+        uint64 id = gateway.lastFulfilledId() + 1;
+        vm.prank(COPROCESSOR);
+        gateway.fulfillAck(id);
+
+        bytes32 input = keccak256("amount");
+        _registerInput(input, AGENT);
+        vm.prank(AGENT);
+        gateway.forceConfidentialTransferFrom(ALICE, BOB, input);
+        uint64 forceId = gateway.nextRequestId() - 1;
+        bytes32 newFrom = keccak256("fNewFrom");
+        bytes32 newTo = keccak256("fNewTo");
+        bytes32 moved = keccak256("fMoved");
+        vm.prank(COPROCESSOR);
+        gateway.fulfillTransfer(
+            forceId, ALICE, BOB, input, newFrom, bytes32(uint256(1)), newTo, bytes32(uint256(2)), moved, bytes32(uint256(3))
+        );
+        require(gateway.isAllowed(newFrom, ALICE) && gateway.isAllowed(newTo, BOB), "parties allowed");
+        require(!gateway.isAllowed(newFrom, observer), "force transfers are unobserved");
+        require(!gateway.isAllowed(moved, observer), "force amount unobserved");
+    }
+
+    function testFrozenSetGrantsAccountAndFreezer() public {
+        _fundConfidential(ALICE);
+        bytes32 input = keccak256("frozen");
+        _registerInput(input, AGENT);
+        vm.prank(AGENT);
+        gateway.setConfidentialFrozen(ALICE, input);
+        uint64 id = gateway.nextRequestId() - 1;
+        bytes32 newFrozen = keccak256("newFrozen");
+        vm.prank(COPROCESSOR);
+        gateway.fulfillFrozenSet(id, ALICE, input, newFrozen, bytes32(uint256(1)));
+        require(gateway.isAllowed(newFrozen, ALICE), "account reads its frozen amount");
+        require(gateway.isAllowed(newFrozen, AGENT), "freezer reads it too");
+        require(!gateway.isAllowed(newFrozen, BOB), "stranger denied");
+    }
+
     function testRolesAreSetAtDeploy() public view {
         require(gateway.agent() == AGENT, "agent");
         require(gateway.coprocessor() == COPROCESSOR, "coprocessor");

@@ -34,7 +34,8 @@ use crate::{Error, Result, chain_err};
 
 /// Every request event's signature hash; the request id is `topics[1]`
 /// in all of them.
-const REQUEST_EVENTS: [B256; 11] = [
+const REQUEST_EVENTS: [B256; 12] = [
+    gw::AllowRequested::SIGNATURE_HASH,
     gw::FaucetRequested::SIGNATURE_HASH,
     gw::WrapRequested::SIGNATURE_HASH,
     gw::TransferRequested::SIGNATURE_HASH,
@@ -136,7 +137,7 @@ impl Client {
         // wallet is the operator's fulfillment wallet, and the lock
         // serializes their nonces (see the operator module docs).
         let mut state = self.state.lock().await;
-        let (handle, commitment) = state.register_input(&bytes)?;
+        let (handle, commitment) = state.register_input(&bytes, self.address)?;
         let pending = self
             .anchor
             .registerInput(handle, commitment, self.address)
@@ -196,6 +197,14 @@ impl Client {
     /// Sets the caller's OWN observer (the zero address removes it).
     pub async fn set_observer(&self, observer: Address) -> Result<()> {
         transact!(self, self.gateway.setObserver(observer)).map(drop)
+    }
+
+    /// Grants `account` read (decryption) access to `handle` — the
+    /// fhEVM `FHE.allow` shape. The caller must already be allowed on
+    /// the handle (chain of custody); resolving means the grant is live
+    /// in the coprocessor's read path too.
+    pub async fn allow(&self, handle: B256, account: Address) -> Result<()> {
+        transact!(self, self.gateway.allow(handle, account)).map(drop)
     }
 
     /// Marks `account` (un)verified in the identity registry

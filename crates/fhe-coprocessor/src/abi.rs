@@ -27,6 +27,7 @@ sol! {
         function blocked(address account) external view returns (bool);
         function isVerified(address account) external view returns (bool);
         function observerOf(address account) external view returns (address);
+        function isAllowed(bytes32 handle, address account) external view returns (bool);
 
         function faucet(uint64 amount) external;
         function wrap(uint64 amount) external;
@@ -41,6 +42,7 @@ sol! {
         function forceConfidentialTransferFrom(address from, address to, bytes32 amountHandle) external;
         function recover(address lost, address recipient) external;
         function unwrap(bytes32 amountHandle) external;
+        function allow(bytes32 handle, address account) external;
 
         function registerInput(bytes32 handle, bytes32 commitment, address owner) external;
         function fulfillAck(uint64 id) external;
@@ -102,7 +104,9 @@ sol! {
         event ForceTransferRequested(uint64 indexed id, address indexed from, address indexed to, bytes32 amountHandle);
         event RecoverRequested(uint64 indexed id, address indexed lost, address indexed recipient);
         event UnwrapRequested(uint64 indexed id, address indexed account, bytes32 amountHandle);
+        event AllowRequested(uint64 indexed id, bytes32 indexed handle, address indexed account);
         event InputRegistered(bytes32 indexed handle, bytes32 commitment, address indexed owner);
+        event Allowed(bytes32 indexed handle, address indexed account);
 
         event RequestAcked(uint64 indexed id);
         event WrapFulfilled(uint64 indexed id, address indexed account, bytes32 newBalanceHandle);
@@ -143,5 +147,6 @@ sol! {
         error OutOfOrderFulfillment(uint64 id, uint64 expected);
         error RequestMismatch(uint64 id);
         error HandleAlreadyAnchored(bytes32 handle);
+        error NotAllowed(bytes32 handle, address account);
     }
 }

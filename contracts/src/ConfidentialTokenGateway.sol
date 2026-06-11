@@ -61,6 +61,12 @@ contract ConfidentialTokenGateway {
     /// @notice Owner of each anchored encrypted input handle.
     mapping(bytes32 => address) public inputOwner;
 
+    /// @notice The on-chain ACL, in the fhEVM shape: which accounts may
+    /// read (decrypt) the ciphertext behind each handle. Written by the
+    /// contract at every handle creation and extended by `allow`; the
+    /// coprocessor's decryption read path enforces exactly this state.
+    mapping(bytes32 => mapping(address => bool)) public isAllowed;
+
     /// @notice Whether transfers are paused (agent-set, public).
     bool public paused;
     /// @notice Blocklist (agent-set, public).
@@ -76,6 +82,14 @@ contract ConfidentialTokenGateway {
     mapping(uint64 => uint8) public requestOp;
     mapping(uint64 => bytes32) public requestHash;
 
+    /// @dev Observer snapshots taken at REQUEST time for wraps and
+    /// transfers, so the ACL grants written at fulfillment reflect the
+    /// observer state the request saw — the coprocessor processes
+    /// requests in id order and mirrors exactly that state. Cleared at
+    /// fulfillment.
+    mapping(uint64 => address) private requestObserverFrom;
+    mapping(uint64 => address) private requestObserverTo;
+
     uint8 public constant OP_FAUCET = 1;
     uint8 public constant OP_WRAP = 2;
     uint8 public constant OP_TRANSFER = 3;
@@ -87,6 +101,7 @@ contract ConfidentialTokenGateway {
     uint8 public constant OP_FORCE_TRANSFER = 9;
     uint8 public constant OP_RECOVER = 10;
     uint8 public constant OP_UNWRAP = 11;
+    uint8 public constant OP_ALLOW = 12;
 
     // ------------------------------------------------------------------
     // Request events (decoded by the coprocessor, processed in id order).
@@ -102,9 +117,14 @@ contract ConfidentialTokenGateway {
     event ForceTransferRequested(uint64 indexed id, address indexed from, address indexed to, bytes32 amountHandle);
     event RecoverRequested(uint64 indexed id, address indexed lost, address indexed recipient);
     event UnwrapRequested(uint64 indexed id, address indexed account, bytes32 amountHandle);
+    event AllowRequested(uint64 indexed id, bytes32 indexed handle, address indexed account);
 
     /// @notice An encrypted input was anchored by the coprocessor.
     event InputRegistered(bytes32 indexed handle, bytes32 commitment, address indexed owner);
+
+    /// @notice `account` may now read (decrypt) the ciphertext behind
+    /// `handle`. Emitted once per (handle, account) grant.
+    event Allowed(bytes32 indexed handle, address indexed account);
 
     // ------------------------------------------------------------------
     // Fulfillment events (the handle rotations the e2e asserts against).
@@ -144,6 +164,7 @@ contract ConfidentialTokenGateway {
     error OutOfOrderFulfillment(uint64 id, uint64 expected);
     error RequestMismatch(uint64 id);
     error HandleAlreadyAnchored(bytes32 handle);
+    error NotAllowed(bytes32 handle, address account);
 
     modifier onlyAgent() {
         if (msg.sender != agent) revert NotAgent();
@@ -181,6 +202,7 @@ contract ConfidentialTokenGateway {
         if (balance < amount) revert InsufficientPublicBalance(msg.sender, balance, amount);
         publicBalance[msg.sender] = balance - amount;
         uint64 id = _request(OP_WRAP, abi.encode(msg.sender, amount));
+        requestObserverFrom[id] = observerOf[msg.sender];
         emit WrapRequested(id, msg.sender, amount);
     }
 
@@ -196,7 +218,22 @@ contract ConfidentialTokenGateway {
         if (confidentialBalanceOf[msg.sender] == 0) revert NoBalance(msg.sender);
         _requireOwnedInput(amountHandle);
         uint64 id = _request(OP_TRANSFER, abi.encode(msg.sender, to, amountHandle));
+        requestObserverFrom[id] = observerOf[msg.sender];
+        requestObserverTo[id] = observerOf[to];
         emit TransferRequested(id, msg.sender, to, amountHandle);
+    }
+
+    /// @notice Grants `account` read (decryption) access to `handle` —
+    /// the fhEVM `FHE.allow` shape. Chain of custody: only a caller the
+    /// ACL already allows on the handle may extend it. The grant is
+    /// public state immediately; the request/ack cycle mirrors it into
+    /// the coprocessor's read path in request order, like the rest of
+    /// the policy state.
+    function allow(bytes32 handle, address account) external {
+        if (!isAllowed[handle][msg.sender]) revert NotAllowed(handle, msg.sender);
+        _allow(handle, account);
+        uint64 id = _request(OP_ALLOW, abi.encode(handle, account));
+        emit AllowRequested(id, handle, account);
     }
 
     /// @notice Sets the caller's OWN observer (address 0 removes it).
@@ -308,6 +345,7 @@ contract ConfidentialTokenGateway {
         if (inputOwner[handle] != address(0)) revert HandleAlreadyAnchored(handle);
         inputOwner[handle] = owner;
         handleCommitment[handle] = commitment;
+        _allow(handle, owner);
         emit InputRegistered(handle, commitment, owner);
     }
 
@@ -321,7 +359,7 @@ contract ConfidentialTokenGateway {
         uint8 op = requestOp[id];
         require(
             op == OP_FAUCET || op == OP_SET_OBSERVER || op == OP_SET_VERIFIED || op == OP_SET_BLOCKED
-                || op == OP_SET_PAUSED,
+                || op == OP_SET_PAUSED || op == OP_ALLOW,
             "ack only for mirror ops"
         );
         _fulfill(id, op, requestHash[id]);
@@ -339,6 +377,11 @@ contract ConfidentialTokenGateway {
     ) external onlyCoprocessor {
         _fulfill(id, OP_WRAP, keccak256(abi.encode(account, amount)));
         _rotate(account, newBalanceHandle, newBalanceCommitment);
+        // The wrapper's mint grant: the account, plus the observer the
+        // request saw (snapshot, so the mirror agrees in request order).
+        _allow(newBalanceHandle, account);
+        _allowObserver(newBalanceHandle, requestObserverFrom[id]);
+        delete requestObserverFrom[id];
         emit WrapFulfilled(id, account, newBalanceHandle);
     }
 
@@ -364,6 +407,21 @@ contract ConfidentialTokenGateway {
         _rotate(from, newFromHandle, newFromCommitment);
         _rotate(to, newToHandle, newToCommitment);
         handleCommitment[transferredHandle] = transferredCommitment;
+        // Each party reads its own rotated balance; both read the
+        // transferred amount. Observer grants come from the snapshots
+        // the request took — force transfers took none (unobserved).
+        _allow(newFromHandle, from);
+        _allow(newToHandle, to);
+        _allow(transferredHandle, from);
+        _allow(transferredHandle, to);
+        address fromObserver = requestObserverFrom[id];
+        address toObserver = requestObserverTo[id];
+        _allowObserver(newFromHandle, fromObserver);
+        _allowObserver(newToHandle, toObserver);
+        _allowObserver(transferredHandle, fromObserver);
+        _allowObserver(transferredHandle, toObserver);
+        delete requestObserverFrom[id];
+        delete requestObserverTo[id];
         emit TransferFulfilled(id, from, to, newFromHandle, newToHandle, transferredHandle);
     }
 
@@ -378,6 +436,9 @@ contract ConfidentialTokenGateway {
         _fulfill(id, OP_SET_FROZEN, keccak256(abi.encode(account, amountHandle)));
         confidentialFrozen[account] = newFrozenHandle;
         handleCommitment[newFrozenHandle] = newFrozenCommitment;
+        // Frozen amounts read by the account and the freezer (agent).
+        _allow(newFrozenHandle, account);
+        _allow(newFrozenHandle, agent);
         emit FrozenSetFulfilled(id, account, newFrozenHandle);
     }
 
@@ -401,6 +462,10 @@ contract ConfidentialTokenGateway {
         confidentialFrozen[recipient] = newRecipientFrozenHandle;
         handleCommitment[newRecipientFrozenHandle] = newRecipientFrozenCommitment;
         delete confidentialFrozen[lost];
+        _allow(newLostHandle, lost);
+        _allow(newRecipientHandle, recipient);
+        _allow(newRecipientFrozenHandle, recipient);
+        _allow(newRecipientFrozenHandle, agent);
         emit RecoverFulfilled(id, lost, recipient, newLostHandle, newRecipientHandle, newRecipientFrozenHandle);
     }
 
@@ -421,6 +486,7 @@ contract ConfidentialTokenGateway {
         if (success) {
             publicBalance[account] += amount;
             _rotate(account, newBalanceHandle, newBalanceCommitment);
+            _allow(newBalanceHandle, account);
         }
         emit UnwrapFulfilled(id, account, amount, success, newBalanceHandle);
     }
@@ -456,5 +522,20 @@ contract ConfidentialTokenGateway {
     function _rotate(address account, bytes32 newHandle, bytes32 commitment) internal {
         confidentialBalanceOf[account] = newHandle;
         handleCommitment[newHandle] = commitment;
+    }
+
+    /// @dev Idempotent ACL grant; emits `Allowed` once per new grant.
+    function _allow(bytes32 handle, address account) internal {
+        if (!isAllowed[handle][account]) {
+            isAllowed[handle][account] = true;
+            emit Allowed(handle, account);
+        }
+    }
+
+    /// @dev Grant to an observer snapshot, skipping the no-observer zero.
+    function _allowObserver(bytes32 handle, address observer) internal {
+        if (observer != address(0)) {
+            _allow(handle, observer);
+        }
     }
 }

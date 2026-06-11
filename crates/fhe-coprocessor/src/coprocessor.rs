@@ -3,7 +3,7 @@
 //! on-chain handle, and the `Address ↔ Account` binding that turns
 //! `msg.sender` into the kit's authenticated caller.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use alloy::primitives::{Address, B256, keccak256};
@@ -45,6 +45,8 @@ pub struct Coprocessor {
     observers: Observers,
     ledger: PublicLedger,
     params: Arc<BfvParameters>,
+    /// The agent (and freezer) address, for the freezer's ACL grants.
+    agent: Address,
     /// Address → kit account, assigned sequentially on first sight in
     /// event order (deterministic under replay).
     accounts: HashMap<Address, u64>,
@@ -52,8 +54,14 @@ pub struct Coprocessor {
     /// Registered input ciphertexts (ownership is enforced on-chain).
     inputs: HashMap<B256, FheUint64>,
     store: HashMap<B256, StoredCiphertext>,
-    /// On-chain handle → kit-internal handle for coprocessor outputs.
-    kit_handles: HashMap<B256, fhe::token::Handle>,
+    /// The mirror of the contract's on-chain ACL (`isAllowed`), built
+    /// from the same request stream that writes it on-chain: handle →
+    /// the addresses allowed to read (decrypt) it. This — not the kit's
+    /// private ACL — is what [`Coprocessor::decrypt_for`] enforces.
+    acl: HashMap<B256, HashSet<Address>>,
+    /// The mirror of the contract's `observerOf`, by address, for the
+    /// observer grants written at handle rotation.
+    observer_of: HashMap<Address, Address>,
     rng: ChaCha20Rng,
     handle_nonce: u64,
 }
@@ -74,11 +82,13 @@ impl Coprocessor {
             observers: Observers::new(),
             ledger: PublicLedger::new(),
             params,
+            agent,
             accounts,
             next_account: AGENT_ACCOUNT + 1,
             inputs: HashMap::new(),
             store: HashMap::new(),
-            kit_handles: HashMap::new(),
+            acl: HashMap::new(),
+            observer_of: HashMap::new(),
             rng,
             handle_nonce: 0,
         })
@@ -131,7 +141,7 @@ impl Coprocessor {
     /// id. The caller (the client) anchors the pair on-chain via
     /// `registerInput`, which is where ownership is bound and enforced;
     /// the user then passes only the handle in their transaction.
-    pub fn register_input(&mut self, bytes: &[u8]) -> Result<(B256, B256)> {
+    pub fn register_input(&mut self, bytes: &[u8], owner: Address) -> Result<(B256, B256)> {
         let ciphertext = FheUint64::from_bytes(bytes, &self.params)?;
         let commitment = keccak256(bytes);
         let handle = self.fresh_handle(commitment);
@@ -143,6 +153,9 @@ impl Coprocessor {
             },
         );
         self.inputs.insert(handle, ciphertext);
+        // The same grant `registerInput` writes on-chain: the owner may
+        // read the input it created.
+        self.allow_mirror(handle, owner);
         Ok((handle, commitment))
     }
 
@@ -231,6 +244,7 @@ impl Coprocessor {
                     self.token.allow(balance, acct, observer)?;
                 }
                 let new_balance = self.export_balance(account)?;
+                self.allow_with_observer(new_balance.handle, account);
                 Ok(Fulfillment::Wrap {
                     id,
                     account,
@@ -261,6 +275,12 @@ impl Coprocessor {
                 let new_from = self.export_balance(from)?;
                 let new_to = self.export_balance(to)?;
                 let transferred = self.export(transferred_kit, from_acct)?;
+                // The grants `fulfillTransfer` writes on-chain for an
+                // observed transfer.
+                self.allow_with_observer(new_from.handle, from);
+                self.allow_with_observer(new_to.handle, to);
+                self.allow_with_observer(transferred.handle, from);
+                self.allow_with_observer(transferred.handle, to);
                 Ok(Fulfillment::Transfer {
                     id,
                     from,
@@ -279,9 +299,11 @@ impl Coprocessor {
                 let acct = self.account_of(account);
                 if observer == Address::ZERO {
                     self.observers.remove_observer(acct);
+                    self.observer_of.remove(&account);
                 } else {
-                    let observer = self.account_of(observer);
-                    self.observers.set_observer(acct, observer);
+                    let observer_acct = self.account_of(observer);
+                    self.observers.set_observer(acct, observer_acct);
+                    self.observer_of.insert(account, observer);
                 }
                 Ok(Fulfillment::Ack { id })
             }
@@ -303,6 +325,9 @@ impl Coprocessor {
                     amount,
                 )?;
                 let new_frozen = self.export(frozen_kit, acct)?;
+                // Frozen amounts read by the account and the freezer.
+                self.allow_mirror(new_frozen.handle, account);
+                self.allow_mirror(new_frozen.handle, self.agent);
                 Ok(Fulfillment::FrozenSet {
                     id,
                     account,
@@ -355,6 +380,12 @@ impl Coprocessor {
                 let new_from = self.export_balance(from)?;
                 let new_to = self.export_balance(to)?;
                 let transferred = self.export(transferred_kit, from_acct)?;
+                // Unobserved on-chain too: each party reads its own
+                // rotated balance, both read the transferred amount.
+                self.allow_mirror(new_from.handle, from);
+                self.allow_mirror(new_to.handle, to);
+                self.allow_mirror(transferred.handle, from);
+                self.allow_mirror(transferred.handle, to);
                 Ok(Fulfillment::Transfer {
                     id,
                     from,
@@ -391,6 +422,10 @@ impl Coprocessor {
                         ))
                     })?;
                 let new_recipient_frozen = self.export(frozen_kit, recipient_acct)?;
+                self.allow_mirror(new_lost.handle, lost);
+                self.allow_mirror(new_recipient.handle, recipient);
+                self.allow_mirror(new_recipient_frozen.handle, recipient);
+                self.allow_mirror(new_recipient_frozen.handle, self.agent);
                 Ok(Fulfillment::Recover {
                     id,
                     lost,
@@ -415,6 +450,7 @@ impl Coprocessor {
                 {
                     Ok(amount) => {
                         let new_balance = self.export_balance(account)?;
+                        self.allow_mirror(new_balance.handle, account);
                         Ok(Fulfillment::Unwrap {
                             id,
                             account,
@@ -445,30 +481,67 @@ impl Coprocessor {
                     }
                 }
             }
+            // Already authorized and written on-chain (chain of custody
+            // checked by the contract); mirrored here in request order.
+            Request::Allow {
+                id,
+                handle,
+                account,
+            } => {
+                self.allow_mirror(handle, account);
+                Ok(Fulfillment::Ack { id })
+            }
         }
     }
 
     /// The on-chain read path: threshold-decrypts the ciphertext behind
-    /// an on-chain `handle` on behalf of `caller`, enforcing the token
-    /// ACL that on-chain transactions (ownership, observer grants)
-    /// built. Integrity-checks the store first.
+    /// an on-chain `handle` on behalf of `caller`, enforcing the
+    /// CONTRACT's ACL — the mirror of `isAllowed` that on-chain
+    /// transactions (ownership, observer grants, `allow`) built.
+    /// Integrity-checks the store first. The decryption itself is the
+    /// committee's designated decryption, exactly as before — only the
+    /// authorization source changed from the kit's private ACL to the
+    /// on-chain state.
     pub fn decrypt_for(&mut self, handle: B256, caller: Address) -> Result<u64> {
         if !self.verify_stored(handle) {
             return Err(Error::State(format!(
                 "stored bytes behind {handle} no longer match their commitment"
             )));
         }
-        let account = *self
-            .accounts
-            .get(&caller)
-            .ok_or_else(|| Error::State(format!("address {caller} is not bound to any account")))?;
-        let kit_handle = self
-            .kit_handles
+        if !self
+            .acl
             .get(&handle)
-            .ok_or_else(|| Error::State(format!("no coprocessor output behind handle {handle}")))?;
+            .is_some_and(|allowed| allowed.contains(&caller))
+        {
+            return Err(Error::State(format!(
+                "the on-chain ACL does not allow {caller} on handle {handle}"
+            )));
+        }
+        let stored = self
+            .store
+            .get(&handle)
+            .ok_or_else(|| Error::State(format!("no ciphertext stored behind handle {handle}")))?;
+        let ciphertext = FheUint64::from_bytes(&stored.bytes, &self.params)?;
         Ok(self
             .token
-            .decrypt_for(*kit_handle, account, &mut self.rng)?)
+            .committee()
+            .threshold_decrypt(&ciphertext, &mut self.rng)?)
+    }
+
+    /// Mirrors one on-chain `Allowed` grant: `who` may read `handle`.
+    fn allow_mirror(&mut self, handle: B256, who: Address) {
+        self.acl.entry(handle).or_default().insert(who);
+    }
+
+    /// Mirrors the contract's rotation grant: the account, plus its
+    /// observer as of the current point in the request stream (the
+    /// contract snapshots the observer at request time; processing in
+    /// request order sees the same state).
+    fn allow_with_observer(&mut self, handle: B256, account: Address) {
+        self.allow_mirror(handle, account);
+        if let Some(observer) = self.observer_of.get(&account).copied() {
+            self.allow_mirror(handle, observer);
+        }
     }
 
     /// Replays `Observers::transfer`'s grants over the RWA transfer's
@@ -512,7 +585,6 @@ impl Coprocessor {
         let handle = self.fresh_handle(commitment);
         self.store
             .insert(handle, StoredCiphertext { bytes, commitment });
-        self.kit_handles.insert(handle, kit_handle);
         Ok(HandleCommitment { handle, commitment })
     }
 

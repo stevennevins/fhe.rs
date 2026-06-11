@@ -114,6 +114,16 @@ pub enum Request {
         /// Registered input handle of the encrypted amount.
         amount_handle: B256,
     },
+    /// ACL grant (already authorized and written on-chain; mirrored
+    /// into the coprocessor's read path in request order).
+    Allow {
+        /// Request id.
+        id: u64,
+        /// The granted handle.
+        handle: B256,
+        /// The account now allowed to read it.
+        account: Address,
+    },
 }
 
 impl Request {
@@ -131,7 +141,8 @@ impl Request {
             | Self::SetPaused { id, .. }
             | Self::ForceTransfer { id, .. }
             | Self::Recover { id, .. }
-            | Self::Unwrap { id, .. } => *id,
+            | Self::Unwrap { id, .. }
+            | Self::Allow { id, .. } => *id,
         }
     }
 
@@ -218,6 +229,13 @@ impl Request {
                 id: e.id,
                 account: e.account,
                 amount_handle: e.amountHandle,
+            }
+        } else if *topic == gw::AllowRequested::SIGNATURE_HASH {
+            let e = decode::<gw::AllowRequested>(log)?;
+            Self::Allow {
+                id: e.id,
+                handle: e.handle,
+                account: e.account,
             }
         } else {
             return Ok(None);
