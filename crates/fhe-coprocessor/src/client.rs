@@ -210,21 +210,35 @@ impl Client {
         transact!(self, self.gateway.setConfidentialFrozen(account, input)).map(drop)
     }
 
-    /// Blocks or unblocks `account` (agent-only).
-    pub async fn set_blocked(&self, account: Address, blocked: bool) -> Result<()> {
-        transact!(self, self.gateway.setBlocked(account, blocked)).map(drop)
+    /// Blocks `account` (agent-only).
+    pub async fn block_user(&self, account: Address) -> Result<()> {
+        transact!(self, self.gateway.blockUser(account)).map(drop)
     }
 
-    /// Pauses or unpauses transfers (agent-only).
-    pub async fn set_paused(&self, paused: bool) -> Result<()> {
-        transact!(self, self.gateway.setPaused(paused)).map(drop)
+    /// Unblocks `account` (agent-only).
+    pub async fn unblock_user(&self, account: Address) -> Result<()> {
+        transact!(self, self.gateway.unblockUser(account)).map(drop)
+    }
+
+    /// Pauses transfers (agent-only).
+    pub async fn pause(&self) -> Result<()> {
+        transact!(self, self.gateway.pause()).map(drop)
+    }
+
+    /// Unpauses transfers (agent-only).
+    pub async fn unpause(&self) -> Result<()> {
+        transact!(self, self.gateway.unpause()).map(drop)
     }
 
     /// Transfers a registered encrypted input from `from` to `to`,
     /// bypassing pause, blocklist, identity, and the frozen guard — but
     /// not the encrypted balance guard (agent-only).
     pub async fn force_transfer(&self, from: Address, to: Address, input: B256) -> Result<()> {
-        transact!(self, self.gateway.forceTransfer(from, to, input)).map(drop)
+        transact!(
+            self,
+            self.gateway.forceConfidentialTransferFrom(from, to, input)
+        )
+        .map(drop)
     }
 
     /// Recovers `lost`'s full confidential balance (frozen included)

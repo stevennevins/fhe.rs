@@ -66,7 +66,7 @@ contract ConfidentialTokenGateway {
     /// @notice Blocklist (agent-set, public).
     mapping(address => bool) public blocked;
     /// @notice Identity registry: transfer recipients must be verified.
-    mapping(address => bool) public verified;
+    mapping(address => bool) public isVerified;
     /// @notice Current observer per account (0 = none). Set only by the
     /// account itself: `msg.sender` is the account, which closes the
     /// kit's unauthenticated `set_observer` caveat.
@@ -192,7 +192,7 @@ contract ConfidentialTokenGateway {
         if (paused) revert TransfersPaused();
         if (blocked[msg.sender]) revert AccountBlocked(msg.sender);
         if (blocked[to]) revert AccountBlocked(to);
-        if (!verified[to]) revert RecipientNotVerified(to);
+        if (!isVerified[to]) revert RecipientNotVerified(to);
         if (confidentialBalanceOf[msg.sender] == 0) revert NoBalance(msg.sender);
         _requireOwnedInput(amountHandle);
         uint64 id = _request(OP_TRANSFER, abi.encode(msg.sender, to, amountHandle));
@@ -208,10 +208,10 @@ contract ConfidentialTokenGateway {
     }
 
     /// @notice Marks `account` (un)verified in the identity registry.
-    function setVerified(address account, bool isVerified) external onlyAgent {
-        verified[account] = isVerified;
-        uint64 id = _request(OP_SET_VERIFIED, abi.encode(account, isVerified));
-        emit VerifiedSetRequested(id, account, isVerified);
+    function setVerified(address account, bool verified) external onlyAgent {
+        isVerified[account] = verified;
+        uint64 id = _request(OP_SET_VERIFIED, abi.encode(account, verified));
+        emit VerifiedSetRequested(id, account, verified);
     }
 
     /// @notice Sets `account`'s encrypted frozen amount to the registered
@@ -222,24 +222,53 @@ contract ConfidentialTokenGateway {
         emit FrozenSetRequested(id, account, amountHandle);
     }
 
-    /// @notice Blocks or unblocks `account` (public blocklist).
-    function setBlocked(address account, bool isBlocked) external onlyAgent {
+    /// @notice Blocks `account` (public blocklist, OZ ERC7984Rwa
+    /// naming).
+    function blockUser(address account) external onlyAgent {
+        _setBlocked(account, true);
+    }
+
+    /// @notice Unblocks `account`.
+    function unblockUser(address account) external onlyAgent {
+        _setBlocked(account, false);
+    }
+
+    function _setBlocked(address account, bool isBlocked) internal {
         blocked[account] = isBlocked;
         uint64 id = _request(OP_SET_BLOCKED, abi.encode(account, isBlocked));
         emit BlockedSetRequested(id, account, isBlocked);
     }
 
-    /// @notice Pauses or unpauses transfers.
-    function setPaused(bool isPaused) external onlyAgent {
+    /// @notice Pauses transfers (OZ Pausable naming).
+    function pause() external onlyAgent {
+        _setPaused(true);
+    }
+
+    /// @notice Unpauses transfers.
+    function unpause() external onlyAgent {
+        _setPaused(false);
+    }
+
+    function _setPaused(bool isPaused) internal {
         paused = isPaused;
         uint64 id = _request(OP_SET_PAUSED, abi.encode(isPaused));
         emit PausedSetRequested(id, isPaused);
     }
 
     /// @notice Agent-only transfer that bypasses pause, blocklist,
-    /// identity, and the frozen guard — but NOT the encrypted balance
+    /// identity, AND the frozen guard — but NOT the encrypted balance
     /// guard: overdraws still silently zero at fulfillment.
-    function forceTransfer(address from, address to, bytes32 amountHandle) external onlyAgent {
+    ///
+    /// DIVERGENCE FROM OZ: ERC7984Rwa's forceConfidentialTransferFrom
+    /// keeps the frozen guard ("frozen tokens must be unfrozen first");
+    /// here the agent's force transfer moves frozen funds too. This is
+    /// the kit's documented Rwa::force_transfer semantics, kept frozen
+    /// by Goal G — the name matches OZ, this behavior deliberately does
+    /// not.
+    function forceConfidentialTransferFrom(address from, address to, bytes32 amountHandle)
+        external
+        onlyAgent
+    {
         if (confidentialBalanceOf[from] == 0) revert NoBalance(from);
         _requireOwnedInput(amountHandle);
         uint64 id = _request(OP_FORCE_TRANSFER, abi.encode(from, to, amountHandle));

@@ -186,23 +186,23 @@ contract ConfidentialTokenGatewayTest {
 
         // Paused.
         vm.prank(AGENT);
-        gateway.setPaused(true);
+        gateway.pause();
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.TransfersPaused.selector));
         vm.prank(ALICE);
         gateway.confidentialTransfer(BOB, bytes32(uint256(0xA)));
         vm.prank(AGENT);
-        gateway.setPaused(false);
+        gateway.unpause();
 
         // Blocked sender, then blocked recipient.
         vm.prank(AGENT);
-        gateway.setBlocked(ALICE, true);
+        gateway.blockUser(ALICE);
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.AccountBlocked.selector, ALICE));
         vm.prank(ALICE);
         gateway.confidentialTransfer(BOB, bytes32(uint256(0xA)));
         vm.prank(AGENT);
-        gateway.setBlocked(ALICE, false);
+        gateway.unblockUser(ALICE);
         vm.prank(AGENT);
-        gateway.setBlocked(BOB, true);
+        gateway.blockUser(BOB);
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.AccountBlocked.selector, BOB));
         vm.prank(ALICE);
         gateway.confidentialTransfer(BOB, bytes32(uint256(0xA)));
@@ -211,10 +211,10 @@ contract ConfidentialTokenGatewayTest {
     function testAgentRoleGates() public {
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.NotAgent.selector));
         vm.prank(ALICE);
-        gateway.setPaused(true);
+        gateway.pause();
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.NotAgent.selector));
         vm.prank(ALICE);
-        gateway.setBlocked(BOB, true);
+        gateway.blockUser(BOB);
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.NotAgent.selector));
         vm.prank(ALICE);
         gateway.setVerified(BOB, true);
@@ -223,7 +223,7 @@ contract ConfidentialTokenGatewayTest {
         gateway.setConfidentialFrozen(BOB, bytes32(uint256(1)));
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.NotAgent.selector));
         vm.prank(ALICE);
-        gateway.forceTransfer(BOB, ALICE, bytes32(uint256(1)));
+        gateway.forceConfidentialTransferFrom(BOB, ALICE, bytes32(uint256(1)));
         vm.expectRevert(abi.encodeWithSelector(ConfidentialTokenGateway.NotAgent.selector));
         vm.prank(ALICE);
         gateway.recover(BOB, ALICE);
@@ -286,11 +286,11 @@ contract ConfidentialTokenGatewayTest {
         vm.prank(COPROCESSOR);
         gateway.registerInput(bytes32(uint256(0xF0)), keccak256("force"), AGENT);
         vm.prank(AGENT);
-        gateway.setPaused(true);
+        gateway.pause();
         vm.prank(AGENT);
-        gateway.setBlocked(ALICE, true);
+        gateway.blockUser(ALICE);
         // No revert despite pause + block + unverified recipient.
         vm.prank(AGENT);
-        gateway.forceTransfer(ALICE, BOB, bytes32(uint256(0xF0)));
+        gateway.forceConfidentialTransferFrom(ALICE, BOB, bytes32(uint256(0xF0)));
     }
 }

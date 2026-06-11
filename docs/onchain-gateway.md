@@ -174,11 +174,37 @@ Known v1 scope cuts, also deliberate:
 | `wrap` | public-balance check + debit | confidential mint (+ observer grant) |
 | `confidentialTransfer` | pause, blocklist, identity, input ownership | freezable double-guard transfer, observer grants |
 | `setObserver` | own account only (`msg.sender`) | mirrors the observer registry |
-| `setVerified` / `setBlocked` / `setPaused` | agent role; takes effect on-chain | mirrors policy state |
+| `setVerified` / `blockUser`/`unblockUser` / `pause`/`unpause` | agent role; takes effect on-chain | mirrors policy state |
 | `setConfidentialFrozen` | agent role, input ownership | stores the encrypted frozen amount |
-| `forceTransfer` | agent role | core-circuit transfer (balance guard only) |
+| `forceConfidentialTransferFrom` | agent role | core-circuit transfer (balance guard only; unlike OZ, moves frozen funds too — see below) |
 | `recover` | agent role | full-balance move, frozen carried as encrypted `min` |
 | `unwrap` | input ownership | threshold-decrypts the amount (by design), credits `publicBalance` on success via the fulfillment |
+
+### Divergences from OZ ERC7984, named
+
+The external surface follows OpenZeppelin's confidential-contracts
+naming (`confidentialTransfer`, `confidentialBalanceOf`,
+`confidentialFrozen`, `setConfidentialFrozen`, `wrap`/`unwrap`,
+`blockUser`/`unblockUser`, `pause`/`unpause`, `isVerified`), with these
+deliberate divergences:
+
+- **`forceConfidentialTransferFrom` moves frozen funds.** OZ's version
+  keeps the frozen guard (frozen tokens must be unfrozen first); the
+  kit's `Rwa::force_transfer` bypasses it by design, and only the
+  encrypted balance guard applies. Same name, different compliance
+  semantics — flagged here and in the contract natspec.
+- **`bytes32` handles instead of `externalEuint64 + inputProof`** —
+  the transport split (see above); input proofs are the named
+  TODO-by-trust-model.
+- **No `confidentialTotalSupply`, operators
+  (`confidentialTransferFrom`/`setOperator`), or token metadata** —
+  supply is not tracked on-chain (the faucet is a test stand-in) and
+  `msg.sender` IS the account, so operator-style delegation is out of
+  scope.
+- **`confidentialTransfer` reverts `NoBalance` for a never-funded
+  sender** where OZ would silently zero; the kit requires an existing
+  balance handle, and the revert (a public "never funded" signal) keeps
+  the coprocessor from processing unfundable transfers.
 
 Latency of the request-tx → fulfillment-tx round trip is measured by the
 e2e harness; see the "On-chain gateway" section of `BENCHMARKS.md`.

@@ -381,7 +381,7 @@ async fn onchain_e2e() {
     eprintln!("e2e: step 6");
     // Step 6: block bob — both directions revert on-chain, with no new
     // handles and no audit growth (no encrypted work at all).
-    as_agent.set_blocked(bob.address, true).await.unwrap();
+    as_agent.block_user(bob.address).await.unwrap();
     let handles_before = operator.state().await.token().handles().len();
     let audits_before = operator.state().await.rwa().freezable().audit_log().len();
     let blocked_input = as_alice.encrypt_input(10).await.unwrap();
@@ -406,8 +406,8 @@ async fn onchain_e2e() {
     // Step 7: pause — only the agent may pause; paused transfers
     // revert; the agent force-transfers from a blocked, fully-frozen
     // sender while paused (core circuit, balance guard only).
-    assert!(as_alice.set_paused(true).await.is_err());
-    as_agent.set_paused(true).await.unwrap();
+    assert!(as_alice.pause().await.is_err());
+    as_agent.pause().await.unwrap();
     let paused_input = as_alice.encrypt_input(10).await.unwrap();
     assert!(
         as_alice
@@ -415,7 +415,7 @@ async fn onchain_e2e() {
             .await
             .is_err()
     );
-    as_agent.set_blocked(alice.address, true).await.unwrap();
+    as_agent.block_user(alice.address).await.unwrap();
     let force_50k = as_agent.encrypt_input(50_000).await.unwrap();
     assert!(
         as_alice
@@ -432,9 +432,9 @@ async fn onchain_e2e() {
         bob
     );
     reference.transfer(alice.address, bob.address, 50_000);
-    as_agent.set_paused(false).await.unwrap();
-    as_agent.set_blocked(alice.address, false).await.unwrap();
-    as_agent.set_blocked(bob.address, false).await.unwrap();
+    as_agent.unpause().await.unwrap();
+    as_agent.unblock_user(alice.address).await.unwrap();
+    as_agent.unblock_user(bob.address).await.unwrap();
     assert_state!();
 
     eprintln!("e2e: step 8");

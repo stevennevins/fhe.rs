@@ -25,7 +25,7 @@ sol! {
         function inputOwner(bytes32 handle) external view returns (address);
         function paused() external view returns (bool);
         function blocked(address account) external view returns (bool);
-        function verified(address account) external view returns (bool);
+        function isVerified(address account) external view returns (bool);
         function observerOf(address account) external view returns (address);
 
         function faucet(uint64 amount) external;
@@ -34,9 +34,11 @@ sol! {
         function setObserver(address observer) external;
         function setVerified(address account, bool isVerified) external;
         function setConfidentialFrozen(address account, bytes32 amountHandle) external;
-        function setBlocked(address account, bool isBlocked) external;
-        function setPaused(bool isPaused) external;
-        function forceTransfer(address from, address to, bytes32 amountHandle) external;
+        function blockUser(address account) external;
+        function unblockUser(address account) external;
+        function pause() external;
+        function unpause() external;
+        function forceConfidentialTransferFrom(address from, address to, bytes32 amountHandle) external;
         function recover(address lost, address recipient) external;
         function unwrap(bytes32 amountHandle) external;
 

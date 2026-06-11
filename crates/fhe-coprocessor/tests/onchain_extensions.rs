@@ -118,22 +118,22 @@ async fn extensions_drive_by_transaction() {
 
     // --- Block: a blocked party reverts on-chain, before any
     // coprocessor work. ---
-    as_agent.set_blocked(bob.address, true).await.unwrap();
+    as_agent.block_user(bob.address).await.unwrap();
     let transfer_1 = as_alice.encrypt_input(1).await.unwrap();
     assert!(as_alice.transfer(bob.address, transfer_1).await.is_err());
-    as_agent.set_blocked(bob.address, false).await.unwrap();
+    as_agent.unblock_user(bob.address).await.unwrap();
 
     // --- Pause + force transfer: paused transfers revert; the agent's
     // force transfer bypasses pause, block, identity, AND the frozen
     // guard (alice's available is 0 < 50 — only the balance guards). ---
-    as_agent.set_paused(true).await.unwrap();
+    as_agent.pause().await.unwrap();
     assert!(as_alice.transfer(bob.address, transfer_1).await.is_err());
     let force_50 = as_agent.encrypt_input(50).await.unwrap();
     as_agent
         .force_transfer(alice.address, bob.address, force_50)
         .await
         .unwrap();
-    as_agent.set_paused(false).await.unwrap();
+    as_agent.unpause().await.unwrap();
     assert_eq!(as_alice.balance(alice.address).await.unwrap(), 650);
     assert_eq!(as_bob.balance(bob.address).await.unwrap(), 350);
 
